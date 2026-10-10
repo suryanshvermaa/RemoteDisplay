@@ -3,7 +3,8 @@ project(RemoteDisplay CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-add_compile_definitions(WIN32_LEAN_AND_MEAN NOMINMAX UNICODE_DISABLED)
+add_compile_definitions(WIN32_LEAN_AND_MEAN NOMINMAX)
+add_compile_options(/utf-8)
 
 set(MF_LIBS d3d11 dxgi dxguid mf mfplat mfuuid wmcodecdspuuid strmiids ole32 oleaut32 ws2_32 winmm)
 

@@ -374,9 +374,10 @@ private:
             case rdh::HostStatus::AwaitingApproval:
                 status = L"● Connection request from " + W(host_.Peer()); c = kAmber; break;
             case rdh::HostStatus::Streaming: {
+                std::string peer = host_.Peer();
+                peer = peer.substr(0, peer.rfind(':'));  // IP only, the port is noise here
                 wchar_t b[160];
-                swprintf_s(b, L"● %s is viewing  -  %.0f fps, %.1f Mbps", W(host_.Peer()).c_str(),
-                           host_.fps.load(), host_.mbps.load());
+                swprintf_s(b, L"● %s viewing - %.0f fps", W(peer).c_str(), host_.fps.load());
                 status = b; c = kGreen; break;
             }
             case rdh::HostStatus::Failed: status = W(host_.Error()); c = kRed; break;

@@ -30,6 +30,14 @@ packet, sliding-window replay protection. A client with the wrong key never gets
 Known limits: a 128-bit key must be copied by hand (a short-code PAKE is a later improvement),
 the host serves one client at a time, and new-handshake requests are rate-limited but unauthenticated.
 
+## Components
+
+- `service/src/host.h`: `RunHost()` capture -> encode -> send, stoppable, reports `HostStatus`
+  (approval gate, disconnect, 1 s encrypted keepalive, same-IP re-pair grace of 2 minutes).
+- `client/src/viewer.h`: `Viewer` window + network/decode thread.
+- `app/main.cpp`: the GUI (`RemoteDisplay.exe`) combining both.
+- `rd-host` / `rd-client`: thin CLI wrappers.
+
 ## Roadmap
 
 1. **Phase 1, virtual display**: IDD (UMDF 2) driver in `driver/`, clone-mode monitor, feed its

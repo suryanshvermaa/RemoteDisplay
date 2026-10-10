@@ -79,6 +79,12 @@ inline void SendFrame(SOCKET s, const Peer& peer, rd::Session& sess, const std::
     }
 }
 
+inline std::string IpOnly(const sockaddr_in& a) {
+    char ip[INET_ADDRSTRLEN] = {};
+    inet_ntop(AF_INET, &a.sin_addr, ip, sizeof(ip));
+    return ip;
+}
+
 inline std::string AddrToString(const sockaddr_in& a) {
     char ip[INET_ADDRSTRLEN] = {};
     inet_ntop(AF_INET, &a.sin_addr, ip, sizeof(ip));
@@ -140,12 +146,18 @@ inline void RunHost(const HostConfig& cfg, std::atomic<bool>& stop, HostStatus& 
     uint32_t frameId = 0;
     std::vector<uint8_t> packet;
     uint64_t statStart = NowUs(), statBytes = 0, statFrames = 0, lastHs = 0, blockUntil = 0;
+    // A client the user approved may re-pair (network blip, restart) from the same IP within this
+    // window without a new prompt. Kick/deny clears it.
+    constexpr uint64_t kApprovalGraceUs = 120'000'000;
+    std::string peerIp, approvedIp;
+    uint64_t approvedAt = 0, lastKeepalive = 0;
     st.state = HostStatus::Waiting;
 
     auto dropClient = [&](uint64_t blockMs) {
         active = rd::Session();
         pending = rd::Session();
         peer.valid = false;
+        if (blockMs > 0) approvedIp.clear();  // kicked or denied: forget the approval
         blockUntil = NowUs() + blockMs * 1000;
         st.fps = 0;
         st.mbps = 0;
@@ -159,6 +171,7 @@ inline void RunHost(const HostConfig& cfg, std::atomic<bool>& stop, HostStatus& 
         if (st.state == HostStatus::AwaitingApproval) {
             if (st.approve.exchange(false)) {
                 st.state = HostStatus::Streaming;
+                approvedIp = peerIp;
                 forceKey = true;
             } else if (st.deny.exchange(false)) {
                 dropClient(30'000);
@@ -207,8 +220,18 @@ inline void RunHost(const HostConfig& cfg, std::atomic<bool>& stop, HostStatus& 
                 pending = rd::Session();
                 ok = true;
                 forceKey = true;
+                peerIp = detail::IpOnly(from);
                 st.SetPeer(detail::AddrToString(from));
-                st.state = cfg.requireApproval ? HostStatus::AwaitingApproval : HostStatus::Streaming;
+                const bool preApproved = !cfg.requireApproval ||
+                                         (peerIp == approvedIp && NowUs() - approvedAt < kApprovalGraceUs);
+                if (preApproved) {
+                    approvedIp = peerIp;
+                    st.state = HostStatus::Streaming;
+                } else {
+                    st.approve = false;
+                    st.deny = false;
+                    st.state = HostStatus::AwaitingApproval;
+                }
             }
             if (!ok || pl < sizeof(rd::PacketHeader)) continue;
             rd::PacketHeader h;
@@ -220,6 +243,20 @@ inline void RunHost(const HostConfig& cfg, std::atomic<bool>& stop, HostStatus& 
             if (h.type == uint8_t(rd::PacketType::KeyReq)) forceKey = true;
         }
         if (peer.valid && NowUs() - peer.lastSeenUs > 5'000'000) dropClient(0);  // client vanished
+        if (st.state == HostStatus::Streaming) approvedAt = NowUs();
+
+        // Keepalive: a static screen (or a pending approval) sends no video, and the client treats
+        // 3 s of silence as "host gone". Tiny encrypted packet once a second.
+        if (peer.valid && active.valid() && NowUs() - lastKeepalive > 1'000'000) {
+            rd::PacketHeader kh = {};
+            kh.magic = rd::kMagic;
+            kh.type = uint8_t(rd::PacketType::Hello);
+            uint8_t kw[sizeof(rd::WireHeader) + sizeof(kh) + rd::kTagLen];
+            size_t kn = active.Seal(reinterpret_cast<uint8_t*>(&kh), sizeof(kh), kw);
+            if (kn) sendto(sock.s, reinterpret_cast<char*>(kw), int(kn), 0,
+                           reinterpret_cast<const sockaddr*>(&peer.addr), sizeof(peer.addr));
+            lastKeepalive = NowUs();
+        }
 
         // --- Capture + encode + send --------------------------------------------------------
         bool lost = false;
