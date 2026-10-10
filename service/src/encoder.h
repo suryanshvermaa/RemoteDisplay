@@ -16,13 +16,16 @@
 
 using Microsoft::WRL::ComPtr;
 
+#include <cstdio>
+#define ENC_FAIL(what, hr) do { fprintf(stderr, "encoder: %s failed (0x%08lx)\n", what, (unsigned long)(hr)); return false; } while (0)
+
 class Encoder {
 public:
     ~Encoder() { if (started_) MFShutdown(); }
 
     bool Init(ID3D11Device* dev, UINT w, UINT h, UINT fps, UINT bitrateBps) {
         w_ = w; h_ = h; fps_ = fps;
-        if (FAILED(MFStartup(MF_VERSION))) return false;
+        if (FAILED(MFStartup(MF_VERSION))) ENC_FAIL("MFStartup", 0);
         started_ = true;
 
         UINT token = 0;
@@ -36,11 +39,11 @@ public:
         if (FAILED(MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER,
                              MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER, &in, &out, &acts,
                              &count)) || count == 0)
-            return false;
+            ENC_FAIL("MFTEnumEx: no hardware H.264 encoder", count);
         HRESULT hr = acts[0]->ActivateObject(IID_PPV_ARGS(&mft_));
         for (UINT32 i = 0; i < count; ++i) acts[i]->Release();
         CoTaskMemFree(acts);
-        if (FAILED(hr)) return false;
+        if (FAILED(hr)) ENC_FAIL("ActivateObject", hr);
 
         ComPtr<IMFAttributes> attrs;
         mft_->GetAttributes(&attrs);
@@ -69,7 +72,7 @@ public:
         MFSetAttributeSize(ot.Get(), MF_MT_FRAME_SIZE, w, h);
         MFSetAttributeRatio(ot.Get(), MF_MT_FRAME_RATE, fps, 1);
         MFSetAttributeRatio(ot.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-        if (FAILED(mft_->SetOutputType(0, ot.Get(), 0))) return false;
+        if (HRESULT e = mft_->SetOutputType(0, ot.Get(), 0); FAILED(e)) ENC_FAIL("SetOutputType", e);
 
         ComPtr<IMFMediaType> it;
         MFCreateMediaType(&it);
@@ -79,7 +82,7 @@ public:
         MFSetAttributeSize(it.Get(), MF_MT_FRAME_SIZE, w, h);
         MFSetAttributeRatio(it.Get(), MF_MT_FRAME_RATE, fps, 1);
         MFSetAttributeRatio(it.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-        if (FAILED(mft_->SetInputType(0, it.Get(), 0))) return false;
+        if (HRESULT e = mft_->SetInputType(0, it.Get(), 0); FAILED(e)) ENC_FAIL("SetInputType", e);
 
         MFT_OUTPUT_STREAM_INFO si = {};
         mft_->GetOutputStreamInfo(0, &si);

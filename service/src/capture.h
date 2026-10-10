@@ -6,7 +6,10 @@
 #include <dxgi1_2.h>
 #include <wrl/client.h>
 
+#include <cstdio>
 #include <vector>
+
+#define CAP_FAIL(what, hr) do { fprintf(stderr, "capture: %s failed (0x%08lx)\n", what, (unsigned long)(hr)); return false; } while (0)
 
 using Microsoft::WRL::ComPtr;
 
@@ -22,26 +25,27 @@ public:
             if (SUCCEEDED(adapter->EnumOutputs(0, &output))) break;
             adapter.Reset();
         }
-        if (!adapter || !output) return false;
+        if (!adapter || !output) CAP_FAIL("no adapter with an attached output", 0);
 
         dev_.Reset();
         ctx_.Reset();
-        if (FAILED(D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
-                                     D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                                     nullptr, 0, D3D11_SDK_VERSION, &dev_, nullptr, &ctx_)))
-            return false;
+        if (HRESULT e = D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+                                         D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                                         nullptr, 0, D3D11_SDK_VERSION, &dev_, nullptr, &ctx_); FAILED(e))
+            CAP_FAIL("D3D11CreateDevice", e);
         ComPtr<ID3D10Multithread> mt;
         if (SUCCEEDED(dev_.As(&mt))) mt->SetMultithreadProtected(TRUE);
 
         ComPtr<IDXGIOutput1> output1;
         if (FAILED(output.As(&output1))) return false;
         dupl_.Reset();
-        if (FAILED(output1->DuplicateOutput(dev_.Get(), &dupl_))) return false;
+        if (HRESULT e = output1->DuplicateOutput(dev_.Get(), &dupl_); FAILED(e)) CAP_FAIL("DuplicateOutput", e);
         DXGI_OUTDUPL_DESC dd;
         dupl_->GetDesc(&dd);
         width_ = dd.ModeDesc.Width & ~1u;  // NV12 needs even dimensions
         height_ = dd.ModeDesc.Height & ~1u;
-        return InitConverter();
+        if (!InitConverter()) CAP_FAIL("video processor setup", 0);
+        return true;
     }
 
     // Waits up to timeoutMs for a new desktop frame. Returns the NV12 texture, or nullptr on
@@ -94,13 +98,13 @@ private:
         td.Usage = D3D11_USAGE_DEFAULT;
 
         td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
         // Desktop may be larger than the even-cropped size; CopyResource needs equal sizes.
         DXGI_OUTDUPL_DESC dd;
         dupl_->GetDesc(&dd);
         td.Width = dd.ModeDesc.Width;
         td.Height = dd.ModeDesc.Height;
-        if (FAILED(dev_->CreateTexture2D(&td, nullptr, &bgra_))) return false;
+        if (HRESULT e = dev_->CreateTexture2D(&td, nullptr, &bgra_); FAILED(e)) CAP_FAIL("create BGRA texture", e);
 
         td.Width = width_;
         td.Height = height_;
@@ -108,12 +112,12 @@ private:
         td.BindFlags = D3D11_BIND_RENDER_TARGET;
         nv12Ring_.assign(8, nullptr);
         for (auto& t : nv12Ring_)
-            if (FAILED(dev_->CreateTexture2D(&td, nullptr, &t))) return false;
+            if (HRESULT e = dev_->CreateTexture2D(&td, nullptr, &t); FAILED(e)) CAP_FAIL("create NV12 texture", e);
 
-        if (FAILED(dev_.As(&vdev_))) return false;
+        if (HRESULT e = dev_.As(&vdev_); FAILED(e)) CAP_FAIL("ID3D11VideoDevice", e);
         ComPtr<ID3D11DeviceContext> c;
         dev_->GetImmediateContext(&c);
-        if (FAILED(c.As(&vctx_))) return false;
+        if (HRESULT e = c.As(&vctx_); FAILED(e)) CAP_FAIL("ID3D11VideoContext", e);
 
         D3D11_VIDEO_PROCESSOR_CONTENT_DESC cd = {};
         cd.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
@@ -122,8 +126,8 @@ private:
         cd.OutputWidth = width_;
         cd.OutputHeight = height_;
         cd.Usage = D3D11_VIDEO_USAGE_OPTIMAL_SPEED;
-        if (FAILED(vdev_->CreateVideoProcessorEnumerator(&cd, &venum_))) return false;
-        if (FAILED(vdev_->CreateVideoProcessor(venum_.Get(), 0, &vp_))) return false;
+        if (HRESULT e = vdev_->CreateVideoProcessorEnumerator(&cd, &venum_); FAILED(e)) CAP_FAIL("VP enumerator", e);
+        if (HRESULT e = vdev_->CreateVideoProcessor(venum_.Get(), 0, &vp_); FAILED(e)) CAP_FAIL("create VP", e);
 
         // RGB full-range in -> BT.709 limited-range YCbCr out.
         D3D11_VIDEO_PROCESSOR_COLOR_SPACE in = {};
@@ -139,7 +143,8 @@ private:
 
         D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd = {};
         ivd.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
-        return SUCCEEDED(vdev_->CreateVideoProcessorInputView(bgra_.Get(), venum_.Get(), &ivd, &inView_));
+        if (HRESULT e = vdev_->CreateVideoProcessorInputView(bgra_.Get(), venum_.Get(), &ivd, &inView_); FAILED(e)) CAP_FAIL("VP input view", e);
+        return true;
     }
 
     ComPtr<ID3D11Device> dev_;

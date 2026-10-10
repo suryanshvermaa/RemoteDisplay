@@ -83,7 +83,8 @@ int main(int argc, char** argv) {
     Capture cap;
     Encoder enc;
     auto initPipeline = [&]() {
-        return cap.Init() && enc.Init(cap.device(), cap.width(), cap.height(), fps, mbps * 1'000'000);
+        if (!cap.Init()) { fprintf(stderr, "capture init failed\n"); return false; }
+        return enc.Init(cap.device(), cap.width(), cap.height(), fps, mbps * 1'000'000);
     };
     if (!initPipeline()) {
         fprintf(stderr, "capture/encoder init failed (need a GPU with a hardware H.264 encoder)\n");
