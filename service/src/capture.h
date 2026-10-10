@@ -6,8 +6,12 @@
 #include <dxgi1_2.h>
 #include <wrl/client.h>
 
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <vector>
+
+#include "protocol.h"
 
 #define CAP_FAIL(what, hr) do { fprintf(stderr, "capture: %s failed (0x%08lx)\n", what, (unsigned long)(hr)); return false; } while (0)
 
@@ -26,6 +30,9 @@ public:
             adapter.Reset();
         }
         if (!adapter || !output) CAP_FAIL("no adapter with an attached output", 0);
+        DXGI_OUTPUT_DESC od = {};
+        output->GetDesc(&od);
+        rect_ = od.DesktopCoordinates;
 
         dev_.Reset();
         ctx_.Reset();
@@ -58,6 +65,12 @@ public:
         if (hr == DXGI_ERROR_WAIT_TIMEOUT) return nullptr;
         if (FAILED(hr)) { lost = true; return nullptr; }
 
+        if (info.PointerShapeBufferSize > 0) ReadPointerShape(info.PointerShapeBufferSize);
+        if (info.LastPresentTime.QuadPart == 0) {  // only the mouse pointer moved: no new picture
+            dupl_->ReleaseFrame();
+            return nullptr;
+        }
+
         ComPtr<ID3D11Texture2D> desktop;
         res.As(&desktop);
         ctx_->CopyResource(bgra_.Get(), desktop.Get());
@@ -84,11 +97,60 @@ public:
     }
 
     ID3D11Texture2D* Last() const { return last_; }
+    const RECT& desktopRect() const { return rect_; }
+
+    // The pointer is not part of the captured picture; its shape is tracked separately so the
+    // viewer can show it as its own local cursor. True once per shape change.
+    bool TakeCursorChange() {
+        bool c = cursorChanged_;
+        cursorChanged_ = false;
+        return c;
+    }
+    const std::vector<uint8_t>& CursorBlob() const { return cursorBlob_; }  // CursorBlobHeader + BGRA
+    uint32_t CursorId() const { return cursorId_; }
     ID3D11Device* device() const { return dev_.Get(); }
     UINT width() const { return width_; }
     UINT height() const { return height_; }
 
 private:
+    void ReadPointerShape(UINT size) {
+        std::vector<uint8_t> buf(size);
+        UINT required = 0;
+        DXGI_OUTDUPL_POINTER_SHAPE_INFO si = {};
+        if (FAILED(dupl_->GetFramePointerShape(size, buf.data(), &required, &si))) return;
+        const UINT w = si.Width;
+        UINT h = si.Height;
+        if (si.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME) h /= 2;  // AND mask above XOR mask
+        if (w == 0 || h == 0 || w > 256 || h > 256) return;
+
+        std::vector<uint8_t> bgra(size_t(w) * h * 4, 0);
+        for (UINT y = 0; y < h; ++y) {
+            for (UINT x = 0; x < w; ++x) {
+                uint8_t* d = &bgra[(size_t(y) * w + x) * 4];
+                if (si.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME) {
+                    const uint8_t bit = uint8_t(0x80 >> (x & 7));
+                    const bool andBit = (buf[size_t(y) * si.Pitch + x / 8] & bit) != 0;
+                    const bool xorBit = (buf[size_t(y + h) * si.Pitch + x / 8] & bit) != 0;
+                    if (andBit && !xorBit) continue;  // transparent
+                    const uint8_t v = (!andBit && xorBit) ? 255 : 0;  // white / black (invert approximated as black)
+                    d[0] = d[1] = d[2] = v;
+                    d[3] = 255;
+                } else {
+                    const uint8_t* sp = &buf[size_t(y) * si.Pitch + size_t(x) * 4];
+                    d[0] = sp[0]; d[1] = sp[1]; d[2] = sp[2];
+                    // MASKED_COLOR uses alpha as an XOR mask; treat it as opaque (an approximation).
+                    d[3] = si.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR ? sp[3] : 255;
+                }
+            }
+        }
+        rd::CursorBlobHeader ch = {int16_t(si.HotSpot.x), int16_t(si.HotSpot.y), uint16_t(w), uint16_t(h)};
+        cursorBlob_.resize(sizeof(ch) + bgra.size());
+        memcpy(cursorBlob_.data(), &ch, sizeof(ch));
+        memcpy(cursorBlob_.data() + sizeof(ch), bgra.data(), bgra.size());
+        ++cursorId_;
+        cursorChanged_ = true;
+    }
+
     bool InitConverter() {
         D3D11_TEXTURE2D_DESC td = {};
         td.Width = width_;
@@ -160,4 +222,8 @@ private:
     ComPtr<ID3D11VideoProcessor> vp_;
     ComPtr<ID3D11VideoProcessorInputView> inView_;
     UINT width_ = 0, height_ = 0;
+    RECT rect_ = {0, 0, 1920, 1080};
+    std::vector<uint8_t> cursorBlob_;
+    uint32_t cursorId_ = 0;
+    bool cursorChanged_ = false;
 };

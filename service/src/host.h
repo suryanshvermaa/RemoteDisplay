@@ -16,6 +16,7 @@
 
 #include "capture.h"
 #include "encoder.h"
+#include "inject.h"
 #include "protocol.h"
 #include "session.h"
 
@@ -28,6 +29,7 @@ struct HostConfig {
     int mbps = 20;
     std::array<uint8_t, rd::kKeyLen> psk{};
     bool requireApproval = true;  // hold video until the local user clicks Allow
+    bool allowControl = true;     // accept mouse/keyboard input from the (approved) viewer
 };
 
 struct HostStatus {
@@ -35,6 +37,7 @@ struct HostStatus {
     std::atomic<int> state{Stopped};
     std::atomic<float> fps{0}, mbps{0};
     std::atomic<bool> approve{false}, deny{false}, kick{false};
+    std::atomic<bool> controlling{false};  // the viewer has used mouse/keyboard in the last 2 s
 
     void SetText(std::string& dst, const std::string& v) { std::lock_guard<std::mutex> l(m_); dst = v; }
     std::string Peer() { std::lock_guard<std::mutex> l(m_); return peer_; }
@@ -79,6 +82,36 @@ inline void SendFrame(SOCKET s, const Peer& peer, rd::Session& sess, const std::
     }
 }
 
+inline void SendCursor(SOCKET s, const Peer& peer, rd::Session& sess, const std::vector<uint8_t>& blob,
+                       uint32_t id) {
+    const size_t total = (blob.size() + rd::kMaxPayload - 1) / rd::kMaxPayload;
+    uint8_t plain[sizeof(rd::PacketHeader) + rd::kMaxPayload];
+    uint8_t wire[sizeof(rd::WireHeader) + sizeof(plain) + rd::kTagLen];
+    for (size_t i = 0; i < total; ++i) {
+        const size_t off = i * rd::kMaxPayload;
+        const size_t n = std::min(rd::kMaxPayload, blob.size() - off);
+        rd::PacketHeader h{rd::kMagic, uint8_t(rd::PacketType::Cursor), 0, uint16_t(i), uint16_t(total),
+                           uint16_t(n), id, 0};
+        memcpy(plain, &h, sizeof(h));
+        memcpy(plain + sizeof(h), blob.data() + off, n);
+        size_t wn = sess.Seal(plain, sizeof(h) + n, wire);
+        if (!wn) return;
+        sendto(s, reinterpret_cast<char*>(wire), int(wn), 0,
+               reinterpret_cast<const sockaddr*>(&peer.addr), sizeof(peer.addr));
+    }
+}
+
+inline void SendAck(SOCKET s, const Peer& peer, rd::Session& sess, uint32_t nextSeq) {
+    rd::PacketHeader h = {};
+    h.magic = rd::kMagic;
+    h.type = uint8_t(rd::PacketType::InputAck);
+    h.frameId = nextSeq;
+    uint8_t wire[sizeof(rd::WireHeader) + sizeof(h) + rd::kTagLen];
+    size_t wn = sess.Seal(reinterpret_cast<uint8_t*>(&h), sizeof(h), wire);
+    if (wn) sendto(s, reinterpret_cast<char*>(wire), int(wn), 0,
+                   reinterpret_cast<const sockaddr*>(&peer.addr), sizeof(peer.addr));
+}
+
 inline std::string IpOnly(const sockaddr_in& a) {
     char ip[INET_ADDRSTRLEN] = {};
     inet_ntop(AF_INET, &a.sin_addr, ip, sizeof(ip));
@@ -106,6 +139,7 @@ inline void RunHost(const HostConfig& cfg, std::atomic<bool>& stop, HostStatus& 
     using detail::NowUs;
     st.state = HostStatus::Starting;
     st.SetError("");
+    SetProcessDPIAware();  // physical-pixel virtual-screen metrics for mapping viewer input
     detail::ComScope com;
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
@@ -128,8 +162,10 @@ inline void RunHost(const HostConfig& cfg, std::atomic<bool>& stop, HostStatus& 
 
     Capture cap;
     Encoder enc;
+    InputInjector inject;
     auto initPipeline = [&]() {
         if (!cap.Init()) return false;
+        inject.SetDesktopRect(cap.desktopRect());
         return enc.Init(cap.device(), cap.width(), cap.height(), cfg.fps, cfg.mbps * 1'000'000);
     };
     if (!initPipeline()) {
@@ -150,7 +186,9 @@ inline void RunHost(const HostConfig& cfg, std::atomic<bool>& stop, HostStatus& 
     // window without a new prompt. Kick/deny clears it.
     constexpr uint64_t kApprovalGraceUs = 120'000'000;
     std::string peerIp, approvedIp;
-    uint64_t approvedAt = 0, lastKeepalive = 0;
+    uint64_t approvedAt = 0, lastKeepalive = 0, lastControlUs = 0, lastCursorSend = 0;
+    uint32_t inputNext = 0;  // next reliable input sequence number we expect from the viewer
+    bool cursorSendNow = false;
     st.state = HostStatus::Waiting;
 
     auto dropClient = [&](uint64_t blockMs) {
@@ -159,6 +197,8 @@ inline void RunHost(const HostConfig& cfg, std::atomic<bool>& stop, HostStatus& 
         peer.valid = false;
         if (blockMs > 0) approvedIp.clear();  // kicked or denied: forget the approval
         blockUntil = NowUs() + blockMs * 1000;
+        inject.ReleaseAll();  // never leave keys or mouse buttons stuck down
+        st.controlling = false;
         st.fps = 0;
         st.mbps = 0;
         st.state = HostStatus::Waiting;
@@ -220,6 +260,8 @@ inline void RunHost(const HostConfig& cfg, std::atomic<bool>& stop, HostStatus& 
                 pending = rd::Session();
                 ok = true;
                 forceKey = true;
+                inputNext = 0;
+                cursorSendNow = true;
                 peerIp = detail::IpOnly(from);
                 st.SetPeer(detail::AddrToString(from));
                 const bool preApproved = !cfg.requireApproval ||
@@ -240,8 +282,41 @@ inline void RunHost(const HostConfig& cfg, std::atomic<bool>& stop, HostStatus& 
             peer.addr = from;  // authenticated, so following the client across NAT rebinding is safe
             peer.valid = true;
             peer.lastSeenUs = NowUs();
-            if (h.type == uint8_t(rd::PacketType::KeyReq)) forceKey = true;
+            if (h.type == uint8_t(rd::PacketType::KeyReq)) {
+                forceKey = true;
+            } else if (h.type == uint8_t(rd::PacketType::InputMove) || h.type == uint8_t(rd::PacketType::Input)) {
+                // Input only counts after the local user approved this viewer AND allows control.
+                if (st.state != HostStatus::Streaming || !cfg.allowControl) continue;
+                const uint8_t* body = plain + sizeof(h);
+                const size_t bl = pl - sizeof(h);
+                if (h.type == uint8_t(rd::PacketType::InputMove)) {
+                    if (bl < sizeof(rd::MoveBody)) continue;
+                    rd::MoveBody mb;
+                    memcpy(&mb, body, sizeof(mb));
+                    inject.Move(mb.x, mb.y);
+                } else {
+                    if (bl < sizeof(rd::InputBody)) continue;
+                    rd::InputBody ib;
+                    memcpy(&ib, body, sizeof(ib));
+                    if (ib.count == 0 || ib.count > rd::kMaxInputEventsPerPacket ||
+                        bl < sizeof(ib) + size_t(ib.count) * sizeof(rd::InputEvent))
+                        continue;
+                    for (unsigned i = 0; i < ib.count; ++i) {
+                        const uint32_t seq = ib.firstSeq + i;
+                        if (int32_t(seq - inputNext) < 0) continue;  // already applied (retransmit)
+                        if (seq != inputNext) break;                 // gap: viewer resends from its oldest unacked
+                        rd::InputEvent ev;
+                        memcpy(&ev, body + sizeof(ib) + i * sizeof(ev), sizeof(ev));
+                        inject.Apply(ev);
+                        ++inputNext;
+                    }
+                    detail::SendAck(sock.s, peer, active, inputNext);
+                }
+                lastControlUs = NowUs();
+                st.controlling = true;
+            }
         }
+        if (st.controlling && NowUs() - lastControlUs > 2'000'000) st.controlling = false;
         if (peer.valid && NowUs() - peer.lastSeenUs > 5'000'000) dropClient(0);  // client vanished
         if (st.state == HostStatus::Streaming) approvedAt = NowUs();
 
@@ -251,6 +326,7 @@ inline void RunHost(const HostConfig& cfg, std::atomic<bool>& stop, HostStatus& 
             rd::PacketHeader kh = {};
             kh.magic = rd::kMagic;
             kh.type = uint8_t(rd::PacketType::Hello);
+            kh.flags = cfg.allowControl ? uint8_t(rd::kFlagControlAllowed) : uint8_t(0);
             uint8_t kw[sizeof(rd::WireHeader) + sizeof(kh) + rd::kTagLen];
             size_t kn = active.Seal(reinterpret_cast<uint8_t*>(&kh), sizeof(kh), kw);
             if (kn) sendto(sock.s, reinterpret_cast<char*>(kw), int(kn), 0,
@@ -260,11 +336,20 @@ inline void RunHost(const HostConfig& cfg, std::atomic<bool>& stop, HostStatus& 
 
         // --- Capture + encode + send --------------------------------------------------------
         bool lost = false;
-        ID3D11Texture2D* tex = cap.Grab(peer.valid ? 8 : 100, lost);
+        ID3D11Texture2D* tex = cap.Grab(peer.valid ? 4 : 100, lost);
         if (lost) {
             if (!initPipeline()) Sleep(500);
             forceKey = true;
             continue;
+        }
+        // The cursor shape travels separately (the picture has no pointer in it): send on change,
+        // on a new client, and every 2 s so a lost fragment heals itself.
+        if (cap.TakeCursorChange()) cursorSendNow = true;
+        if (peer.valid && active.valid() && st.state == HostStatus::Streaming && !cap.CursorBlob().empty() &&
+            (cursorSendNow || NowUs() - lastCursorSend > 2'000'000)) {
+            detail::SendCursor(sock.s, peer, active, cap.CursorBlob(), cap.CursorId());
+            lastCursorSend = NowUs();
+            cursorSendNow = false;
         }
         if (!tex && forceKey) tex = cap.Last();  // static screen but client needs an IDR
         if (!tex || !peer.valid || st.state != HostStatus::Streaming) continue;
@@ -285,6 +370,8 @@ inline void RunHost(const HostConfig& cfg, std::atomic<bool>& stop, HostStatus& 
             statBytes = statFrames = 0;
         }
     }
+    inject.ReleaseAll();
+    st.controlling = false;
     st.fps = 0;
     st.mbps = 0;
     st.SetPeer("");
