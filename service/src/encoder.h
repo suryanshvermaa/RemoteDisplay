@@ -25,8 +25,10 @@ public:
 
     bool Init(ID3D11Device* dev, UINT w, UINT h, UINT fps, UINT bitrateBps) {
         w_ = w; h_ = h; fps_ = fps;
-        if (FAILED(MFStartup(MF_VERSION))) ENC_FAIL("MFStartup", 0);
-        started_ = true;
+        if (!started_) {
+            if (FAILED(MFStartup(MF_VERSION))) ENC_FAIL("MFStartup", 0);
+            started_ = true;
+        }
 
         UINT token = 0;
         if (FAILED(MFCreateDXGIDeviceManager(&token, &mgr_))) return false;
