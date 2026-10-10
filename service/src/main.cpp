@@ -14,6 +14,7 @@
 #include "capture.h"
 #include "encoder.h"
 #include "protocol.h"
+#include "session.h"
 
 namespace {
 
@@ -28,20 +29,23 @@ struct Peer {
     uint64_t lastSeenUs = 0;
 };
 
-void SendFrame(SOCKET s, const Peer& peer, const std::vector<uint8_t>& data, uint32_t frameId,
-               bool key, uint64_t captureUs) {
+void SendFrame(SOCKET s, const Peer& peer, rd::Session& sess, const std::vector<uint8_t>& data,
+               uint32_t frameId, bool key, uint64_t captureUs) {
     const size_t total = (data.size() + rd::kMaxPayload - 1) / rd::kMaxPayload;
-    char pkt[sizeof(rd::PacketHeader) + rd::kMaxPayload];
+    uint8_t plain[sizeof(rd::PacketHeader) + rd::kMaxPayload];
+    uint8_t wire[sizeof(rd::WireHeader) + sizeof(plain) + rd::kTagLen];
     for (size_t i = 0; i < total; ++i) {
         const size_t off = i * rd::kMaxPayload;
         const size_t n = std::min(rd::kMaxPayload, data.size() - off);
         rd::PacketHeader h{rd::kMagic, uint8_t(rd::PacketType::Video),
                            uint8_t(key ? rd::kFlagKeyframe : 0), uint16_t(i), uint16_t(total),
                            uint16_t(n), frameId, captureUs};
-        memcpy(pkt, &h, sizeof(h));
-        memcpy(pkt + sizeof(h), data.data() + off, n);
-        sendto(s, pkt, int(sizeof(h) + n), 0, reinterpret_cast<const sockaddr*>(&peer.addr),
-               sizeof(peer.addr));
+        memcpy(plain, &h, sizeof(h));
+        memcpy(plain + sizeof(h), data.data() + off, n);
+        size_t wn = sess.Seal(plain, sizeof(h) + n, wire);
+        if (!wn) return;
+        sendto(s, reinterpret_cast<char*>(wire), int(wn), 0,
+               reinterpret_cast<const sockaddr*>(&peer.addr), sizeof(peer.addr));
     }
 }
 
@@ -50,17 +54,24 @@ void SendFrame(SOCKET s, const Peer& peer, const std::vector<uint8_t>& data, uin
 int main(int argc, char** argv) {
     std::string listenIp = "127.0.0.1";
     int port = rd::kDefaultPort, fps = 60, mbps = 20;
+    std::string keyText;
     for (int i = 1; i + 1 < argc; i += 2) {
         std::string a = argv[i];
         if (a == "--listen") listenIp = argv[i + 1];
         else if (a == "--port") port = atoi(argv[i + 1]);
         else if (a == "--fps") fps = atoi(argv[i + 1]);
         else if (a == "--mbps") mbps = atoi(argv[i + 1]);
+        else if (a == "--key") keyText = argv[i + 1];
     }
-    if (listenIp != "127.0.0.1")
-        fprintf(stderr, "WARNING: listening on %s with NO encryption or authentication.\n"
-                        "Anyone who can reach this port can watch your screen.\n", listenIp.c_str());
+    uint8_t psk[rd::kKeyLen];
+    if (keyText.empty()) {
+        rd::crypto::Random(psk, sizeof(psk));
+    } else if (!rd::ParseKey(keyText, psk)) {
+        fprintf(stderr, "invalid --key (expected 26 base32 characters)\n");
+        return 1;
+    }
 
+    setvbuf(stdout, nullptr, _IONBF, 0);
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     timeBeginPeriod(1);
     WSADATA wsa;
@@ -92,32 +103,72 @@ int main(int argc, char** argv) {
     }
     printf("rd-host %ux%u @%dfps %dMbps, listening on %s:%d\n", cap.width(), cap.height(), fps, mbps,
            listenIp.c_str(), port);
+    printf("Pairing key: %s\n(enter this in the client with --key; all traffic is encrypted)\n",
+           rd::FormatKey(psk).c_str());
 
     Peer peer;
+    rd::Session active, pending;
+    uint8_t cachedHs1[rd::kHs1Len] = {};
+    uint8_t cachedHs2[sizeof(rd::WireHeader) + rd::kHs2Len] = {};
     bool forceKey = true;
     uint32_t frameId = 0;
     std::vector<uint8_t> packet;
-    uint64_t statStart = NowUs(), statBytes = 0, statFrames = 0;
+    uint64_t statStart = NowUs(), statBytes = 0, statFrames = 0, lastHs = 0;
 
     for (;;) {
-        // Control packets from the client.
-        char rbuf[64];
+        // Datagrams from clients: handshake or encrypted control packets.
+        uint8_t rbuf[512], plain[512];
         sockaddr_in from;
-        int fl = sizeof(from);
         while (true) {
-            int n = recvfrom(sock, rbuf, sizeof(rbuf), 0, reinterpret_cast<sockaddr*>(&from), &fl);
-            if (n < int(sizeof(rd::PacketHeader))) break;
-            rd::PacketHeader h;
-            memcpy(&h, rbuf, sizeof(h));
-            if (h.magic != rd::kMagic) continue;
-            if (h.type == uint8_t(rd::PacketType::Hello)) {
-                if (!peer.valid || memcmp(&peer.addr, &from, sizeof(from)) != 0) forceKey = true;
-                peer.addr = from;
-                peer.valid = true;
-                peer.lastSeenUs = NowUs();
-            } else if (h.type == uint8_t(rd::PacketType::KeyReq)) {
-                forceKey = true;
+            int fl = sizeof(from);
+            int n = recvfrom(sock, reinterpret_cast<char*>(rbuf), sizeof(rbuf), 0,
+                             reinterpret_cast<sockaddr*>(&from), &fl);
+            if (n < int(sizeof(rd::WireHeader))) break;
+            rd::WireHeader wh;
+            memcpy(&wh, rbuf, sizeof(wh));
+            if (wh.magic != rd::kWireMagic) continue;
+
+            if (wh.type == uint8_t(rd::WireType::Hs1)) {
+                if (n != int(sizeof(wh) + rd::kHs1Len)) continue;
+                // Client retransmits the same Hs1 until it sees our Hs2; answer duplicates with the
+                // same cached Hs2 so the pending session stays consistent with what the client holds.
+                if (pending.valid() && memcmp(rbuf + sizeof(wh), cachedHs1, rd::kHs1Len) == 0) {
+                    sendto(sock, reinterpret_cast<char*>(cachedHs2), sizeof(cachedHs2), 0,
+                           reinterpret_cast<sockaddr*>(&from), sizeof(from));
+                    continue;
+                }
+                if (NowUs() - lastHs < 100'000) continue;  // rate-limit new handshakes
+                lastHs = NowUs();
+                rd::WireHeader oh = {rd::kWireMagic, uint8_t(rd::WireType::Hs2), {}, 0};
+                memcpy(cachedHs2, &oh, sizeof(oh));
+                if (!rd::HostRespond(psk, rbuf + sizeof(wh), cachedHs2 + sizeof(oh), pending)) continue;
+                memcpy(cachedHs1, rbuf + sizeof(wh), rd::kHs1Len);
+                sendto(sock, reinterpret_cast<char*>(cachedHs2), sizeof(cachedHs2), 0,
+                       reinterpret_cast<sockaddr*>(&from), sizeof(from));
+                continue;
             }
+            if (wh.type != uint8_t(rd::WireType::Data)) continue;
+
+            size_t pl = 0;
+            bool ok = active.valid() && active.Open(rbuf, n, plain, pl);
+            if (!ok && pending.valid() && pending.Open(rbuf, n, plain, pl)) {
+                // First authenticated packet of a new handshake: the client knows the pairing key.
+                active = std::move(pending);
+                pending = rd::Session();
+                ok = true;
+                forceKey = true;
+                printf("client connected from %d.%d.%d.%d:%u\n", from.sin_addr.S_un.S_un_b.s_b1,
+                       from.sin_addr.S_un.S_un_b.s_b2, from.sin_addr.S_un.S_un_b.s_b3,
+                       from.sin_addr.S_un.S_un_b.s_b4, ntohs(from.sin_port));
+            }
+            if (!ok || pl < sizeof(rd::PacketHeader)) continue;
+            rd::PacketHeader h;
+            memcpy(&h, plain, sizeof(h));
+            if (h.magic != rd::kMagic) continue;
+            peer.addr = from;  // authenticated, so following the client across NAT rebinding is safe
+            peer.valid = true;
+            peer.lastSeenUs = NowUs();
+            if (h.type == uint8_t(rd::PacketType::KeyReq)) forceKey = true;
         }
         if (peer.valid && NowUs() - peer.lastSeenUs > 5'000'000) {
             peer.valid = false;
@@ -139,7 +190,7 @@ int main(int argc, char** argv) {
         if (!enc.Encode(tex, forceKey, packet, key)) continue;
         if (forceKey && key) forceKey = false;
 
-        SendFrame(sock, peer, packet, frameId++, key, capUs);
+        SendFrame(sock, peer, active, packet, frameId++, key, capUs);
         statBytes += packet.size();
         ++statFrames;
         if (NowUs() - statStart >= 2'000'000) {

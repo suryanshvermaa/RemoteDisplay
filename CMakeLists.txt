@@ -9,11 +9,11 @@ set(MF_LIBS d3d11 dxgi dxguid mf mfplat mfuuid wmcodecdspuuid strmiids ole32 ole
 
 add_executable(rd-host service/src/main.cpp)
 target_include_directories(rd-host PRIVATE service/include)
-target_link_libraries(rd-host PRIVATE ${MF_LIBS})
+target_link_libraries(rd-host PRIVATE ${MF_LIBS} bcrypt)
 
 add_executable(rd-client WIN32 client/src/main.cpp)
 target_include_directories(rd-client PRIVATE service/include)  # shared protocol.h
-target_link_libraries(rd-client PRIVATE ${MF_LIBS} user32)
+target_link_libraries(rd-client PRIVATE ${MF_LIBS} user32 bcrypt)
 
 add_executable(test-session tests/test_session.cpp)
 target_include_directories(test-session PRIVATE service/include)

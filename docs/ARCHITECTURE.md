@@ -17,22 +17,26 @@ Latency design choices:
 - Encoder is drop-if-busy: a late frame is discarded rather than queued.
 - Idle screen sends nothing; a requested IDR re-encodes the last frame.
 
-## Run locally
+## Run
 
 ```
-build\Release\rd-host.exe
-build\Release\rd-client.exe
+build\Released-host.exe                      # prints a pairing key
+build\Released-client.exe --key <that key>
 ```
-LAN: `rd-host --listen 0.0.0.0` and `rd-client --host <host-ip>`. **No encryption or auth yet**, so do
-not expose the port beyond a trusted network until Phase 2 is done.
+LAN or internet: `rd-host --listen 0.0.0.0` and `rd-client --host <host-ip> --key <key>`.
+The host binds loopback by default. Every datagram is authenticated and encrypted (see
+`service/include/session.h`): ECDH P-256 handshake bound to the 128-bit pairing key, AES-128-GCM per
+packet, sliding-window replay protection. A client with the wrong key never gets a session.
+Known limits: a 128-bit key must be copied by hand (a short-code PAKE is a later improvement),
+the host serves one client at a time, and new-handshake requests are rate-limited but unauthenticated.
 
 ## Roadmap
 
 1. **Phase 1, virtual display**: IDD (UMDF 2) driver in `driver/`, clone-mode monitor, feed its
    swapchain frames into the same encoder. Must be verified empirically (see below).
-2. **Phase 2, internet**: pairing code + signaling server, STUN + UDP hole punching, relay
-   fallback, authenticated key exchange and AEAD encryption of every datagram (libsodium),
-   pacing of keyframe bursts, congestion control (bitrate adaptation from loss/RTT reports).
+2. **Phase 2, internet**: DONE encryption + authentication. TODO signaling server, STUN + UDP hole
+   punching, relay fallback, pacing of keyframe bursts, congestion control (bitrate adaptation
+   from loss/RTT reports).
 3. **Phase 3**: input return channel (SendInput; SYSTEM service for UAC/secure desktop),
    audio (WASAPI loopback + Opus), clipboard, multi-monitor, cursor as separate stream, FEC.
 

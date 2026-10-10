@@ -1,5 +1,5 @@
 // rd-client: UDP -> reassemble -> hardware H.264 decode -> D3D11 present (tearing allowed).
-//   rd-client [--host <ip>] [--port <n>]
+//   rd-client --key <pairing-key> [--host <ip>] [--port <n>]
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -15,7 +15,9 @@
 #include <wmcodecdsp.h>
 #include <wrl/client.h>
 
+#include <array>
 #include <atomic>
+#include <memory>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -24,6 +26,7 @@
 #include <vector>
 
 #include "protocol.h"
+#include "session.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -292,15 +295,7 @@ private:
 };
 
 // ---------------------------------------------------------------------------------------------
-void SendCtrl(SOCKET s, const sockaddr_in& host, rd::PacketType t) {
-    rd::PacketHeader h = {};
-    h.magic = rd::kMagic;
-    h.type = uint8_t(t);
-    sendto(s, reinterpret_cast<char*>(&h), sizeof(h), 0, reinterpret_cast<const sockaddr*>(&host),
-           sizeof(host));
-}
-
-void Worker(std::string hostIp, int port) {
+void Worker(std::string hostIp, int port, std::array<uint8_t, rd::kKeyLen> psk) {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     MFStartup(MF_VERSION);
 
@@ -336,21 +331,80 @@ void Worker(std::string hostIp, int port) {
     uint64_t lastHello = 0, lastKeyReq = 0;
     uint64_t statStart = NowUs(), statFrames = 0, statBytes = 0, decUsSum = 0;
 
+    // Secure session state: handshake until the host proves it knows the pairing key.
+    rd::Session sess;
+    std::unique_ptr<rd::ClientHandshake> hs;
+    uint8_t hs1Wire[sizeof(rd::WireHeader) + rd::kHs1Len];
+    bool connected = false;
+    uint64_t lastHs = 0, lastRx = NowUs();
+
+    auto sendCtrl = [&](rd::PacketType t) {
+        if (!connected) return;
+        rd::PacketHeader ch = {};
+        ch.magic = rd::kMagic;
+        ch.type = uint8_t(t);
+        uint8_t wire[sizeof(rd::WireHeader) + sizeof(ch) + rd::kTagLen];
+        size_t wn = sess.Seal(reinterpret_cast<uint8_t*>(&ch), sizeof(ch), wire);
+        if (wn) sendto(sock, reinterpret_cast<char*>(wire), int(wn), 0,
+                       reinterpret_cast<sockaddr*>(&host), sizeof(host));
+    };
     auto requestKey = [&]() {
         needKey = true;
         if (NowUs() - lastKeyReq > 100'000) {  // at most 10 requests/sec
-            SendCtrl(sock, host, rd::PacketType::KeyReq);
+            sendCtrl(rd::PacketType::KeyReq);
             lastKeyReq = NowUs();
         }
     };
 
+    uint8_t wirebuf[sizeof(rd::WireHeader) + sizeof(rd::PacketHeader) + rd::kMaxPayload + rd::kTagLen + 64];
     std::vector<char> pkt(sizeof(rd::PacketHeader) + rd::kMaxPayload + 64);
     while (g_run) {
-        if (NowUs() - lastHello > 1'000'000) {
-            SendCtrl(sock, host, rd::PacketType::Hello);
+        if (connected && NowUs() - lastRx > 3'000'000) {  // host gone or restarted: re-pair
+            connected = false;
+            sess = rd::Session();
+            hs.reset();
+            haveCur = false;
+            needKey = true;
+            SetWindowTextA(g_hwnd, "rd-client  reconnecting...");
+        }
+        if (!connected && NowUs() - lastHs > 300'000) {
+            if (!hs) {  // new ephemeral keys; retransmit the SAME Hs1 until Hs2 arrives
+                hs = std::make_unique<rd::ClientHandshake>();
+                rd::WireHeader oh = {rd::kWireMagic, uint8_t(rd::WireType::Hs1), {}, 0};
+                memcpy(hs1Wire, &oh, sizeof(oh));
+                if (!hs->Begin(hs1Wire + sizeof(oh))) { hs.reset(); continue; }
+            }
+            sendto(sock, reinterpret_cast<char*>(hs1Wire), sizeof(hs1Wire), 0,
+                   reinterpret_cast<sockaddr*>(&host), sizeof(host));
+            lastHs = NowUs();
+        }
+        if (connected && NowUs() - lastHello > 1'000'000) {
+            sendCtrl(rd::PacketType::Hello);
             lastHello = NowUs();
         }
-        int n = recv(sock, pkt.data(), int(pkt.size()), 0);
+
+        int wn = recv(sock, reinterpret_cast<char*>(wirebuf), int(sizeof(wirebuf)), 0);
+        if (wn < int(sizeof(rd::WireHeader))) continue;
+        rd::WireHeader wh;
+        memcpy(&wh, wirebuf, sizeof(wh));
+        if (wh.magic != rd::kWireMagic) continue;
+        if (wh.type == uint8_t(rd::WireType::Hs2)) {
+            if (!connected && hs && wn == int(sizeof(wh) + rd::kHs2Len) &&
+                hs->Finish(psk.data(), wirebuf + sizeof(wh), sess)) {
+                connected = true;
+                lastRx = NowUs();
+                sendCtrl(rd::PacketType::Hello);  // first authenticated packet activates the host session
+                lastHello = NowUs();
+                needKey = true;
+                SetWindowTextA(g_hwnd, "rd-client  connected");
+            }
+            continue;
+        }
+        if (wh.type != uint8_t(rd::WireType::Data) || !connected) continue;
+        size_t plen = 0;
+        if (!sess.Open(wirebuf, size_t(wn), reinterpret_cast<uint8_t*>(pkt.data()), plen)) continue;
+        lastRx = NowUs();
+        int n = int(plen);
         if (n < int(sizeof(rd::PacketHeader))) continue;
         rd::PacketHeader h;
         memcpy(&h, pkt.data(), sizeof(h));
@@ -415,12 +469,20 @@ void Worker(std::string hostIp, int port) {
 int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmd, int show) {
     std::string hostIp = "127.0.0.1";
     int port = rd::kDefaultPort;
+    std::string keyText;
     int argc = __argc;
     char** argv = __argv;
     for (int i = 1; i + 1 < argc; i += 2) {
         std::string a = argv[i];
         if (a == "--host") hostIp = argv[i + 1];
         else if (a == "--port") port = atoi(argv[i + 1]);
+        else if (a == "--key") keyText = argv[i + 1];
+    }
+    std::array<uint8_t, rd::kKeyLen> psk{};
+    if (!rd::ParseKey(keyText, psk.data())) {
+        MessageBoxA(nullptr, "Usage: rd-client --key <pairing key shown by rd-host> [--host <ip>] [--port <n>]",
+                    "rd-client", MB_ICONERROR);
+        return 1;
     }
 
     WSADATA wsa;
@@ -439,7 +501,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmd, int show) {
                            CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top, nullptr, nullptr,
                            inst, nullptr);
 
-    std::thread worker(Worker, hostIp, port);
+    std::thread worker(Worker, hostIp, port, psk);
     MSG msg;
     while (GetMessage(&msg, nullptr, 0, 0)) {
         TranslateMessage(&msg);
