@@ -5,19 +5,23 @@
 #include <windows.h>
 #include <iphlpapi.h>
 #include <wincrypt.h>
+#include <commctrl.h>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdarg>
 #include <cstdio>
 #include <string>
 #include <vector>
 
+#include "identity.h"
 #include "protocol.h"
 #include "session.h"
 
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "crypt32.lib")
+#pragma comment(lib, "comctl32.lib")
 
 namespace rdapp {
 
@@ -71,6 +75,12 @@ inline bool Unprotect(const std::string& hexs, std::vector<uint8_t>& result) {
     LocalFree(out.pbData);
     return true;
 }
+
+struct TrustedDevice {
+    rd::DeviceId id{};
+    std::string name;
+    std::string added;  // date text, for display
+};
 
 struct Recent {
     std::string addr;
@@ -132,6 +142,60 @@ public:
             Set(L"recent", L"addr" + std::to_wstring(i), r[i].addr);
             Set(L"recent", L"key" + std::to_wstring(i), Protect(r[i].key.data(), r[i].key.size()));
         }
+    }
+
+    // ---- trusted devices (approved with "Always allow this device") -------------------------------
+    std::vector<TrustedDevice> TrustedDevices() const {
+        std::vector<TrustedDevice> out;
+        const int count = atoi(Get(L"trusted", L"count").c_str());
+        for (int i = 0; i < count && i < 256; ++i) {
+            TrustedDevice d;
+            if (!rd::IdFromHex(Get(L"trusted", L"id" + std::to_wstring(i)), d.id)) continue;
+            d.name = Get(L"trusted", L"name" + std::to_wstring(i));
+            d.added = Get(L"trusted", L"added" + std::to_wstring(i));
+            out.push_back(d);
+        }
+        return out;
+    }
+    bool IsTrusted(const rd::DeviceId& id) const {
+        for (const auto& d : TrustedDevices())
+            if (d.id == id) return true;
+        return false;
+    }
+    void SaveTrusted(const std::vector<TrustedDevice>& list) const {
+        Set(L"trusted", L"count", std::to_string(list.size()));
+        for (size_t i = 0; i < list.size(); ++i) {
+            Set(L"trusted", L"id" + std::to_wstring(i), rd::IdToHex(list[i].id));
+            Set(L"trusted", L"name" + std::to_wstring(i), list[i].name);
+            Set(L"trusted", L"added" + std::to_wstring(i), list[i].added);
+        }
+    }
+    void AddTrusted(const rd::DeviceId& id, const std::string& name) const {
+        auto list = TrustedDevices();
+        for (auto& d : list)
+            if (d.id == id) { d.name = name; SaveTrusted(list); return; }
+        SYSTEMTIME t;
+        GetLocalTime(&t);
+        char date[32];
+        snprintf(date, sizeof(date), "%04d-%02d-%02d", t.wYear, t.wMonth, t.wDay);
+        list.push_back({id, name, date});
+        SaveTrusted(list);
+    }
+    void RemoveTrusted(const rd::DeviceId& id) const {
+        auto list = TrustedDevices();
+        list.erase(std::remove_if(list.begin(), list.end(), [&](const TrustedDevice& d) { return d.id == id; }), list.end());
+        SaveTrusted(list);
+    }
+    void ClearTrusted() const { SaveTrusted({}); }
+
+    // ---- this PC's identity when it acts as a viewer (permanent key, DPAPI-protected) ---------------
+    bool LoadDeviceIdentity(rd::DeviceIdentity& id) const {
+        std::vector<uint8_t> blob;
+        if (Unprotect(Get(L"device", L"key"), blob) && id.Load(blob)) return true;
+        if (!id.Generate()) return false;
+        const auto priv = id.ExportPrivate();
+        Set(L"device", L"key", Protect(priv.data(), priv.size()));
+        return true;
     }
 
 private:
@@ -241,6 +305,53 @@ inline bool SetStartupEnabled(bool on) {
     const std::wstring cmd = L"\"" + SelfPath() + L"\" --background";
     return RegSetKeyValueW(HKEY_CURRENT_USER, kRunKey, kRunValue, REG_SZ, cmd.c_str(),
                            DWORD((cmd.size() + 1) * sizeof(wchar_t))) == ERROR_SUCCESS;
+}
+
+inline std::string DeviceName() {
+    wchar_t n[MAX_COMPUTERNAME_LENGTH + 1] = {};
+    DWORD len = DWORD(std::size(n));
+    GetComputerNameW(n, &len);
+    return U(n);
+}
+
+// ---- connection-approval prompt -------------------------------------------------------------------
+// A Task Dialog with three choices. `ph.hwnd` lets another thread dismiss it if the situation changes
+// (the viewer left, or turned out to be a trusted device).
+struct PromptHandle {
+    std::atomic<HWND> hwnd{nullptr};
+};
+inline HRESULT CALLBACK ApprovalCallback(HWND h, UINT msg, WPARAM, LPARAM, LONG_PTR data) {
+    auto* ph = reinterpret_cast<PromptHandle*>(data);
+    if (msg == TDN_CREATED) ph->hwnd = h;
+    if (msg == TDN_DESTROYED) ph->hwnd = nullptr;
+    return S_OK;
+}
+inline void DismissPrompt(PromptHandle& ph) {
+    if (HWND h = ph.hwnd) PostMessage(h, TDM_CLICK_BUTTON, IDCANCEL, 0);
+}
+// Returns 0 = deny, 1 = allow once, 2 = always allow this device.
+inline int AskApproval(HWND owner, const std::wstring& who, bool control, bool canRemember, PromptHandle& ph) {
+    const std::wstring content = who + L" has your pairing key and wants to connect.";
+    TASKDIALOG_BUTTON buttons[3];
+    int n = 0;
+    buttons[n++] = {1002, L"Allow once"};
+    if (canRemember) buttons[n++] = {1003, L"Always allow this device"};
+    buttons[n++] = {1001, L"Deny"};
+    TASKDIALOGCONFIG tc = {sizeof(tc)};
+    tc.hwndParent = owner;
+    tc.dwFlags = TDF_USE_COMMAND_LINKS | TDF_ALLOW_DIALOG_CANCELLATION;
+    tc.pszWindowTitle = L"RemoteDisplay - connection request";
+    tc.pszMainIcon = TD_WARNING_ICON;
+    tc.pszMainInstruction = control ? L"Allow this device to view and control your PC?" : L"Allow this device to view your PC?";
+    tc.pszContent = content.c_str();
+    tc.cButtons = UINT(n);
+    tc.pButtons = buttons;
+    tc.nDefaultButton = 1001;  // Deny is the default: an accidental Enter never grants access
+    tc.pfCallback = ApprovalCallback;
+    tc.lpCallbackData = reinterpret_cast<LONG_PTR>(&ph);
+    int pressed = 0;
+    if (FAILED(TaskDialogIndirect(&tc, &pressed, nullptr, nullptr))) return 0;
+    return pressed == 1002 ? 1 : pressed == 1003 ? 2 : 0;
 }
 
 inline std::wstring UserDataDir() {

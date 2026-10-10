@@ -80,7 +80,7 @@ Wait 3
 $dlg = [B]::FindWindow("#32770", "RemoteDisplay - connection request")
 Check ($dlg -ne [IntPtr]::Zero) "approval prompt appears with the main window hidden"
 if ($dlg -ne [IntPtr]::Zero) {
-  [B]::SendMessage([B]::FindWindowEx($dlg, [IntPtr]::Zero, "Button", "&Yes"), 0xF5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+  [B]::PostMessage($dlg, 0x0466, [IntPtr]1002, [IntPtr]::Zero) | Out-Null   # TDM_CLICK_BUTTON: "Allow once"
 }
 Wait 4
 $viewer = [B]::Windows([uint32]$cli.Id, $true) | Select -First 1

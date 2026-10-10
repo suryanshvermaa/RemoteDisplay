@@ -9,9 +9,17 @@
 #include <cstring>
 #include <string>
 
+#include "common.h"
 #include "host.h"
 
 namespace rdapp {
+
+// The host asks the saved config who is trusted, and writes newly trusted devices into it.
+class ConfigTrust : public rdh::TrustStore {
+public:
+    bool IsTrusted(const rd::DeviceId& id) override { return Config().IsTrusted(id); }
+    void Remember(const rd::DeviceId& id, const std::string& name) override { Config().AddTrusted(id, name); }
+};
 
 constexpr wchar_t kStatusMapName[] = L"Local\\RemoteDisplayStatus";
 constexpr wchar_t kKickEventName[] = L"Local\\RemoteDisplayKick";

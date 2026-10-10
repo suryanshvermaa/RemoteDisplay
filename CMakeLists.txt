@@ -13,8 +13,8 @@ target_include_directories(rd-host PRIVATE service/include)
 target_link_libraries(rd-host PRIVATE ${MF_LIBS} bcrypt)
 
 add_executable(rd-client WIN32 client/src/main.cpp)
-target_include_directories(rd-client PRIVATE service/include)  # shared protocol.h
-target_link_libraries(rd-client PRIVATE ${MF_LIBS} user32 bcrypt)
+target_include_directories(rd-client PRIVATE service/include app)  # shared protocol.h, common.h
+target_link_libraries(rd-client PRIVATE ${MF_LIBS} user32 bcrypt crypt32 iphlpapi comctl32)
 
 add_executable(test-session tests/test_session.cpp)
 target_include_directories(test-session PRIVATE service/include)

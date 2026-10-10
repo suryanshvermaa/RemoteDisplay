@@ -60,9 +60,7 @@ $dlg = [U]::FindWindow("#32770", "RemoteDisplay - connection request")
 "approval dialog found: " + ($dlg -ne [IntPtr]::Zero)
 if ($dlg -ne [IntPtr]::Zero) {
   Shot $dlg "ui-approval.png"
-  $yes = [U]::FindWindowEx($dlg, [IntPtr]::Zero, "Button", "&Yes")
-  "yes button handle    : $yes"
-  Click $yes                                         # A: Allow
+  [U]::PostMessage($dlg, 0x0466, [IntPtr]1002, [IntPtr]::Zero) | Out-Null   # TDM_CLICK_BUTTON: "Allow once"
   Start-Sleep -Seconds 1
   "A status 1s after Yes: " + (Text ([U]::GetDlgItem($ha, $IDC.STATUS)))
   "dialog still open    : " + ([U]::FindWindow("#32770", "RemoteDisplay - connection request") -ne [IntPtr]::Zero)

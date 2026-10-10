@@ -34,6 +34,8 @@ inline int RunWorker() {
     hc.psk = cfg.HostKey();
     hc.requireApproval = cfg.RequireApproval();
     hc.allowControl = cfg.AllowControl();
+    ConfigTrust trust;
+    hc.trust = &trust;
     Log(log, "listening on UDP %d, approval %s, control %s", hc.port, hc.requireApproval ? "required" : "not required",
         hc.allowControl ? "allowed" : "view only");
 
@@ -51,6 +53,7 @@ inline int RunWorker() {
 
         std::thread prompt;
         std::atomic<bool> prompting{false};
+        PromptHandle promptHandle;
         int lastState = -1;
         while (!done) {
             status.Publish(st);
@@ -64,19 +67,23 @@ inline int RunWorker() {
             if (s == rdh::HostStatus::AwaitingApproval && !prompting) {
                 if (prompt.joinable()) prompt.join();
                 prompting = true;
-                const std::string peer = st.Peer();
-                prompt = std::thread([&, peer] {
-                    std::wstring msg = W(peer) + (hc.allowControl ? L" has your pairing key and wants to view and control your screen."
-                                                     : L" has your pairing key and wants to view your screen.") +
-                                       L"\n\nAllow this connection?";
-                    int r = MessageBoxW(nullptr, msg.c_str(), L"RemoteDisplay - connection request",
-                                        MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2 | MB_SETFOREGROUND | MB_TOPMOST);
-                    if (st.state == rdh::HostStatus::AwaitingApproval) {  // client may have left meanwhile
-                        if (r == IDYES) st.approve = true; else st.deny = true;
+                std::string who = st.Peer();
+                if (st.PeerKnown()) who = st.PeerName() + " (" + who + ")";
+                const bool canRemember = st.PeerKnown();
+                prompt = std::thread([&, who, canRemember] {
+                    const int r = AskApproval(nullptr, W(who), hc.allowControl, canRemember, promptHandle);
+                    if (st.state == rdh::HostStatus::AwaitingApproval) {  // viewer may have left meanwhile
+                        if (r == 0) {
+                            st.deny = true;
+                        } else {
+                            if (r == 2) st.remember = true;
+                            st.approve = true;
+                        }
                     }
                     prompting = false;
                 });
             }
+            if (s != rdh::HostStatus::AwaitingApproval && prompting) DismissPrompt(promptHandle);  // no longer needed
             Sleep(250);
         }
         host.join();

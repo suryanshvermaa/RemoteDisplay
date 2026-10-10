@@ -254,7 +254,11 @@ public:
         return true;
     }
 
-    bool Setup(const uint8_t txKey[kKeyLen], const uint8_t rxKey[kKeyLen]) {
+    // Hash of this session's handshake; a device signs it to prove who it is (see identity.h).
+    const uint8_t* transcriptHash() const { return th_; }
+
+    bool Setup(const uint8_t txKey[kKeyLen], const uint8_t rxKey[kKeyLen], const uint8_t th[32]) {
+        memcpy(th_, th, 32);
         valid_ = tx_.Init(txKey) && rx_.Init(rxKey);
         txSeq_ = 0; maxSeq_ = 0; window_ = 0; any_ = false;
         return valid_;
@@ -279,6 +283,7 @@ private:
     }
 
     crypto::Aead tx_, rx_;
+    uint8_t th_[32] = {};
     uint64_t txSeq_ = 0, maxSeq_ = 0, window_ = 0;
     bool any_ = false, valid_ = false;
 };
@@ -295,7 +300,7 @@ inline bool DeriveSession(const uint8_t psk[kKeyLen], const uint8_t* cNonceAndPu
     if (!crypto::Hmac(psk, kKeyLen, m, prk)) return false;
     const char a[] = "rd-h2c", b[] = "rd-c2h";
     if (!crypto::Hmac(prk, 32, {a, a + 6}, h2c) || !crypto::Hmac(prk, 32, {b, b + 6}, c2h)) return false;
-    return isHost ? s.Setup(h2c, c2h) : s.Setup(c2h, h2c);
+    return isHost ? s.Setup(h2c, c2h, th) : s.Setup(c2h, h2c, th);
 }
 
 inline bool HostMac(const uint8_t psk[kKeyLen], const uint8_t th[32], uint8_t out[32]) {

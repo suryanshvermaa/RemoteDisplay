@@ -42,7 +42,14 @@ function Wait($s) { Start-Sleep -Seconds $s }
 function ClickDialog($title, $button) {
   for ($i = 0; $i -lt 20; $i++) {
     $d = [T]::FindWindow("#32770", $title)
-    if ($d -ne [IntPtr]::Zero) { [T]::SendMessage([T]::FindWindowEx($d, [IntPtr]::Zero, "Button", $button), 0xF5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null; return $true }
+    if ($d -ne [IntPtr]::Zero) {
+      if ($title -eq "RemoteDisplay - connection request") {   # a Task Dialog: press "Allow once" with TDM_CLICK_BUTTON
+        [T]::PostMessage($d, 0x0466, [IntPtr]1002, [IntPtr]::Zero) | Out-Null
+      } else {
+        [T]::SendMessage([T]::FindWindowEx($d, [IntPtr]::Zero, "Button", $button), 0xF5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+      }
+      return $true
+    }
     Start-Sleep -Milliseconds 250
   }
   return $false

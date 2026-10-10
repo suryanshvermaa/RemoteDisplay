@@ -31,6 +31,7 @@
 #include <thread>
 #include <vector>
 
+#include "identity.h"
 #include "protocol.h"
 #include "session.h"
 
@@ -50,8 +51,10 @@ public:
     // Must be called on the thread that runs the message loop. When the window is closed,
     // `closedMsg` is posted to `owner` (WPARAM = Viewer*); the owner then deletes the Viewer.
     // With owner == nullptr, closing the window posts WM_QUIT instead.
+    // `identity` (optional) lets the host recognise this PC as a device it already approved.
     static Viewer* Create(HINSTANCE inst, HWND owner, UINT closedMsg, const std::string& host, int port,
-                          const std::array<uint8_t, rd::kKeyLen>& psk);
+                          const std::array<uint8_t, rd::kKeyLen>& psk, const rd::DeviceIdentity* identity = nullptr,
+                          const std::string& deviceName = "");
 
     ~Viewer() {
         run = false;
@@ -67,6 +70,8 @@ public:
     }
 
     HWND hwnd = nullptr;
+    const rd::DeviceIdentity* identity = nullptr;
+    std::string deviceName;
     std::atomic<bool> run{true};
     std::atomic<UINT> winW{1280}, winH{720};
     std::thread worker;
@@ -522,7 +527,8 @@ inline void Worker(Viewer* v, std::string hostIp, int port, std::array<uint8_t, 
     std::unique_ptr<rd::ClientHandshake> hs;
     uint8_t hs1Wire[sizeof(rd::WireHeader) + rd::kHs1Len];
     bool connected = false;
-    uint64_t lastHs = 0, lastRx = NowUs();
+    uint64_t lastHs = 0, lastRx = NowUs(), lastIdent = 0;
+    bool gotHostData = false;  // the host answered after we connected: it has seen our Identify
 
     auto sendCtrl = [&](rd::PacketType t) {
         if (!connected) return;
@@ -545,6 +551,11 @@ inline void Worker(Viewer* v, std::string hostIp, int port, std::array<uint8_t, 
         if (n) memcpy(plain + sizeof(ph), body, n);
         size_t wn = sess.Seal(plain, sizeof(ph) + n, wire);
         if (wn) sendto(sock, reinterpret_cast<char*>(wire), int(wn), 0, reinterpret_cast<sockaddr*>(&host), sizeof(host));
+    };
+    auto sendIdentify = [&]() {
+        uint8_t body[rd::kIdentifyLen];
+        if (v->identity && v->identity->BuildIdentify(sess, v->deviceName, body))
+            sendInner(rd::PacketType::Identify, 0, body, sizeof(body));
     };
     auto resetInput = [&]() {
         inAcked = 0;
@@ -619,6 +630,10 @@ inline void Worker(Viewer* v, std::string hostIp, int port, std::array<uint8_t, 
             sendCtrl(rd::PacketType::Hello);
             lastHello = NowUs();
         }
+        if (connected && !gotHostData && v->identity && NowUs() - lastIdent > 300'000) {  // until the host answers
+            sendIdentify();
+            lastIdent = NowUs();
+        }
         pumpInput();
 
         int wn = recv(sock, reinterpret_cast<char*>(wirebuf), int(sizeof(wirebuf)), 0);
@@ -631,7 +646,13 @@ inline void Worker(Viewer* v, std::string hostIp, int port, std::array<uint8_t, 
                 hs->Finish(psk.data(), wirebuf + sizeof(wh), sess)) {
                 connected = true;
                 lastRx = NowUs();
-                sendCtrl(rd::PacketType::Hello);  // first authenticated packet activates the host session
+                gotHostData = false;
+                if (v->identity) {  // the first authenticated packet says which device this is
+                    sendIdentify();
+                    lastIdent = NowUs();
+                } else {
+                    sendCtrl(rd::PacketType::Hello);  // first authenticated packet activates the host session
+                }
                 lastHello = NowUs();
                 needKey = true;
                 resetInput();
@@ -643,6 +664,7 @@ inline void Worker(Viewer* v, std::string hostIp, int port, std::array<uint8_t, 
         size_t plen = 0;
         if (!sess.Open(wirebuf, size_t(wn), reinterpret_cast<uint8_t*>(pkt.data()), plen)) continue;
         lastRx = NowUs();
+        gotHostData = true;
         int n = int(plen);
         if (n < int(sizeof(rd::PacketHeader))) continue;
         rd::PacketHeader h;
@@ -865,7 +887,8 @@ inline LRESULT CALLBACK Viewer::LlKeyboardProc(int code, WPARAM w, LPARAM l) {
 }
 
 inline Viewer* Viewer::Create(HINSTANCE inst, HWND owner, UINT closedMsg, const std::string& host, int port,
-                              const std::array<uint8_t, rd::kKeyLen>& psk) {
+                              const std::array<uint8_t, rd::kKeyLen>& psk, const rd::DeviceIdentity* identity,
+                              const std::string& deviceName) {
     static const bool registered = [inst] {
         WNDCLASSA wc = {};
         wc.lpfnWndProc = WndProc;
@@ -879,6 +902,8 @@ inline Viewer* Viewer::Create(HINSTANCE inst, HWND owner, UINT closedMsg, const 
     auto* v = new Viewer;
     v->owner_ = owner;
     v->closedMsg_ = closedMsg;
+    v->identity = identity;
+    v->deviceName = deviceName;
     RECT rc = {0, 0, 1280, 720};
     AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
     const std::string title = "RemoteDisplay - " + host + "  -  connecting...";

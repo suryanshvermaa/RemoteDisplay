@@ -19,6 +19,7 @@ enum class PacketType : uint8_t {
     InputMove = 5,  // client -> host: latest mouse position (unreliable, newest wins)
     InputAck = 6,   // host -> client: frameId = next input sequence number it expects
     Cursor = 7,     // host -> client: one fragment of the cursor shape (frameId = shape id)
+    Identify = 8,   // client -> host: device public key + signature over this session (identity.h)
 };
 
 enum PacketFlags : uint8_t {

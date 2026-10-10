@@ -3,6 +3,7 @@
 #include <array>
 #include <string>
 
+#include "common.h"
 #include "viewer.h"
 
 int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
@@ -26,7 +27,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
     WSAStartup(MAKEWORD(2, 2), &wsa);
     timeBeginPeriod(1);
 
-    std::unique_ptr<rdv::Viewer> v(rdv::Viewer::Create(inst, nullptr, 0, hostIp, port, psk));
+    rd::DeviceIdentity identity;  // same permanent device key as the app, so "Always allow" works here too
+    rdapp::Config().LoadDeviceIdentity(identity);
+    std::unique_ptr<rdv::Viewer> v(rdv::Viewer::Create(inst, nullptr, 0, hostIp, port, psk, &identity, rdapp::DeviceName()));
     if (!v) return 1;
     MSG msg;
     while (GetMessage(&msg, nullptr, 0, 0)) {

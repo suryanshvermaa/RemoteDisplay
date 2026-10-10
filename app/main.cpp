@@ -37,7 +37,7 @@ enum Ctl {
     IDC_IPS = 100, IDC_COPY_IP, IDC_KEY, IDC_COPY_KEY, IDC_NEW_KEY, IDC_APPROVE, IDC_SHARE, IDC_STATUS,
     IDC_DISCONNECT, IDC_REMOTE, IDC_REMOTE_KEY, IDC_CONNECT, IDC_MSG, IDC_HINT,
     IDC_LBL_ADDR, IDC_LBL_KEY, IDC_LBL_RADDR, IDC_LBL_RKEY, IDC_TITLE_L, IDC_TITLE_R,
-    IDC_SVC_TITLE, IDC_SVC_STATUS, IDC_SVC_BTN, IDC_SVC_HINT, IDC_CONTROL, IDC_AUTOSTART, IDC_SHOWTRAY,
+    IDC_SVC_TITLE, IDC_SVC_STATUS, IDC_SVC_BTN, IDC_SVC_HINT, IDC_CONTROL, IDC_AUTOSTART, IDC_SHOWTRAY, IDC_TRUSTED,
 };
 enum TrayCmd { IDM_OPEN = 2001, IDM_TOGGLE, IDM_DISCONNECT, IDM_EXIT };
 constexpr UINT kMsgViewerClosed = WM_APP + 10, kMsgSvcDone = WM_APP + 11, kMsgTray = WM_APP + 20,
@@ -178,6 +178,8 @@ private:
         hostCfg_.psk = cfg_->HostKey();
         hostCfg_.requireApproval = cfg_->RequireApproval();
         hostCfg_.allowControl = cfg_->AllowControl();
+        hostCfg_.trust = &trust_;               // devices approved with "Always allow" skip the prompt
+        cfg_->LoadDeviceIdentity(identity_);    // this PC's permanent key when it connects out
 
         // ---- left card: share this PC
         Add(L"STATIC", L"THIS PC", SS_LEFT, 44, 108, 200, 16, IDC_LBL_ADDR + 100);
@@ -189,6 +191,7 @@ private:
         Add(L"EDIT", L"", ES_READONLY | ES_AUTOHSCROLL | WS_TABSTOP, 44, 244, 252, 28, IDC_KEY, WS_EX_CLIENTEDGE);
         Add(L"BUTTON", L"Copy", BS_PUSHBUTTON | WS_TABSTOP, 304, 244, 60, 28, IDC_COPY_KEY);
         Add(L"BUTTON", L"Generate a new key", BS_PUSHBUTTON | WS_TABSTOP, 44, 278, 150, 24, IDC_NEW_KEY);
+        Add(L"BUTTON", L"Trusted devices...", BS_PUSHBUTTON | WS_TABSTOP, 204, 278, 160, 24, IDC_TRUSTED);
         Add(L"BUTTON", L"Ask me before allowing a connection", BS_AUTOCHECKBOX | WS_TABSTOP, 44, 306, 320, 24, IDC_APPROVE);
         Add(L"BUTTON", L"Allow mouse and keyboard control", BS_AUTOCHECKBOX | WS_TABSTOP, 44, 332, 320, 24, IDC_CONTROL);
         Add(L"BUTTON", L"Start sharing", BS_OWNERDRAW | WS_TABSTOP, 44, 364, 320, 40, IDC_SHARE);
@@ -414,6 +417,7 @@ private:
 
     void UpdateUi() {
         if (++tick_ % 4 == 1 && !svcBusy_) svcState_ = QueryServiceState();  // about once a second
+        if (host_.state != rdh::HostStatus::AwaitingApproval) DismissPrompt(promptHandle_);  // stale: viewer left / trusted
         const View v = CurrentView();
         const int s = v.state;
         const bool sharing = Sharing();
@@ -486,14 +490,124 @@ private:
         const bool visible = IsWindowVisible(hwnd_) != FALSE;
         if (visible && IsIconic(hwnd_)) ShowWindow(hwnd_, SW_RESTORE);
         if (visible) SetForegroundWindow(hwnd_);
-        std::wstring msg = W(host_.Peer()) + (hostCfg_.allowControl ? L" has your pairing key and wants to view and control your screen."
-                                                              : L" has your pairing key and wants to view your screen.") +
-                           L"\n\nAllow this connection?";
-        int r = MessageBoxW(visible ? hwnd_ : nullptr, msg.c_str(), L"RemoteDisplay - connection request",
-                            MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2 | MB_SETFOREGROUND | MB_TOPMOST);
-        if (host_.state == rdh::HostStatus::AwaitingApproval) {  // client may have left meanwhile
-            if (r == IDYES) host_.approve = true; else host_.deny = true;
+        std::string who = host_.Peer();
+        const bool known = host_.PeerKnown();
+        if (known) who = host_.PeerName() + " (" + who + ")";
+        const int r = AskApproval(visible ? hwnd_ : nullptr, W(who), hostCfg_.allowControl, known, promptHandle_);
+        if (host_.state == rdh::HostStatus::AwaitingApproval) {  // the viewer may have left meanwhile
+            if (r == 0) {
+                host_.deny = true;
+            } else {
+                if (r == 2) host_.remember = true;  // trusted from now on
+                host_.approve = true;
+            }
         }
+    }
+
+    // ---- trusted devices dialog ------------------------------------------------------------------
+    enum { IDT_LIST = 301, IDT_REMOVE, IDT_CLEAR, IDT_CLOSE };
+    struct TrustedCtx {
+        App* app = nullptr;
+        std::vector<TrustedDevice> list;
+        HWND listbox = nullptr;
+    };
+
+    static void FillTrusted(TrustedCtx* c, HWND dlg) {
+        SendMessage(c->listbox, LB_RESETCONTENT, 0, 0);
+        c->list = c->app->cfg_->TrustedDevices();
+        for (const auto& d : c->list) {
+            const std::wstring line = W(d.name.empty() ? "unnamed device" : d.name) + L"    (added " + W(d.added) + L")";
+            SendMessageW(c->listbox, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(line.c_str()));
+        }
+        EnableWindow(GetDlgItem(dlg, IDT_REMOVE), FALSE);
+        EnableWindow(GetDlgItem(dlg, IDT_CLEAR), !c->list.empty());
+    }
+
+    static LRESULT CALLBACK TrustedProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+        if (m == WM_NCCREATE) SetWindowLongPtr(h, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(reinterpret_cast<CREATESTRUCT*>(l)->lpCreateParams));
+        auto* c = reinterpret_cast<TrustedCtx*>(GetWindowLongPtr(h, GWLP_USERDATA));
+        if (!c) return DefWindowProcW(h, m, w, l);
+        App* a = c->app;
+        switch (m) {
+            case WM_CREATE: {
+                auto mk = [&](const wchar_t* cls, const wchar_t* text, DWORD style, int x, int y, int ww, int hh, int id) {
+                    HWND ch = CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | style, a->S(x), a->S(y), a->S(ww), a->S(hh), h,
+                                              reinterpret_cast<HMENU>(INT_PTR(id)), a->inst_, nullptr);
+                    SendMessage(ch, WM_SETFONT, reinterpret_cast<WPARAM>(a->fontNormal_), TRUE);
+                    return ch;
+                };
+                mk(L"STATIC", L"Devices you chose to \"Always allow\". They connect without asking, but still need your pairing key.",
+                   SS_LEFT, 16, 12, 420, 36, 0);
+                c->listbox = mk(L"LISTBOX", L"", WS_BORDER | WS_VSCROLL | LBS_NOTIFY | WS_TABSTOP, 16, 56, 420, 180, IDT_LIST);
+                mk(L"BUTTON", L"Remove selected", BS_PUSHBUTTON | WS_TABSTOP, 16, 248, 130, 28, IDT_REMOVE);
+                mk(L"BUTTON", L"Remove all", BS_PUSHBUTTON | WS_TABSTOP, 156, 248, 110, 28, IDT_CLEAR);
+                mk(L"BUTTON", L"Close", BS_DEFPUSHBUTTON | WS_TABSTOP, 336, 248, 100, 28, IDT_CLOSE);
+                FillTrusted(c, h);
+                return 0;
+            }
+            case WM_COMMAND:
+                switch (LOWORD(w)) {
+                    case IDT_LIST:
+                        if (HIWORD(w) == LBN_SELCHANGE) EnableWindow(GetDlgItem(h, IDT_REMOVE), SendMessage(c->listbox, LB_GETCURSEL, 0, 0) >= 0);
+                        break;
+                    case IDT_REMOVE: {
+                        const LRESULT i = SendMessage(c->listbox, LB_GETCURSEL, 0, 0);
+                        if (i >= 0 && size_t(i) < c->list.size()) {
+                            a->cfg_->RemoveTrusted(c->list[size_t(i)].id);
+                            FillTrusted(c, h);
+                        }
+                        break;
+                    }
+                    case IDT_CLEAR:
+                        if (MessageBoxW(h, L"Remove every trusted device? They will have to be approved again.", L"RemoteDisplay",
+                                        MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES) {
+                            a->cfg_->ClearTrusted();
+                            FillTrusted(c, h);
+                        }
+                        break;
+                    case IDT_CLOSE: DestroyWindow(h); break;
+                }
+                return 0;
+            case WM_CLOSE: DestroyWindow(h); return 0;
+        }
+        return DefWindowProcW(h, m, w, l);
+    }
+
+    void ShowTrustedDialog() {
+        static bool registered = false;
+        if (!registered) {
+            WNDCLASSW wc = {};
+            wc.lpfnWndProc = TrustedProc;
+            wc.hInstance = inst_;
+            wc.lpszClassName = L"RDTrusted";
+            wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+            wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+            RegisterClassW(&wc);
+            registered = true;
+        }
+        TrustedCtx ctx;
+        ctx.app = this;
+        RECT rc = {0, 0, S(452), S(292)};
+        const DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+        AdjustWindowRect(&rc, style, FALSE);
+        RECT pr;
+        GetWindowRect(hwnd_, &pr);
+        const int w = rc.right - rc.left, h = rc.bottom - rc.top;
+        HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"RDTrusted", L"Trusted devices", style, pr.left + ((pr.right - pr.left) - w) / 2,
+                                   pr.top + ((pr.bottom - pr.top) - h) / 2, w, h, hwnd_, nullptr, inst_, &ctx);
+        if (!dlg) return;
+        EnableWindow(hwnd_, FALSE);  // modal
+        ShowWindow(dlg, SW_SHOW);
+        MSG msg;
+        while (IsWindow(dlg) && GetMessageW(&msg, nullptr, 0, 0)) {
+            if (msg.message == WM_QUIT) { PostQuitMessage(int(msg.wParam)); break; }
+            if (!IsDialogMessageW(dlg, &msg)) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+        EnableWindow(hwnd_, TRUE);
+        SetForegroundWindow(hwnd_);
     }
 
     // ---- connecting -----------------------------------------------------------------------
@@ -509,7 +623,7 @@ private:
         int port = 0;
         if (!ResolveAddress(text, ip, port)) { Message(L"Could not find that address."); return; }
 
-        auto* v = rdv::Viewer::Create(inst_, hwnd_, kMsgViewerClosed, ip, port, psk);
+        auto* v = rdv::Viewer::Create(inst_, hwnd_, kMsgViewerClosed, ip, port, psk, &identity_, DeviceName());
         if (!v) { Message(L"Could not open the viewer window."); return; }
         viewers_.emplace_back(v);
         Recent r;
@@ -697,6 +811,7 @@ private:
                 return 0;
             case WM_COMMAND:
                 switch (LOWORD(w)) {
+                    case IDC_TRUSTED: ShowTrustedDialog(); break;
                     case IDM_OPEN: ShowMain(); break;
                     case IDM_TOGGLE: ToggleSharing(); break;
                     case IDM_DISCONNECT:
@@ -817,6 +932,9 @@ private:
     std::thread svcThread_;
     unsigned tick_ = 0;
     HostActiveLock ownLock_;
+    ConfigTrust trust_;
+    rd::DeviceIdentity identity_;
+    PromptHandle promptHandle_;
 
     bool background_ = false, forceExit_ = false, tipShown_ = false, trayAdded_ = false, showTray_ = true;
     UINT taskbarCreated_ = 0;

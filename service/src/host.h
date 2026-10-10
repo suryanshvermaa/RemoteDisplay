@@ -16,11 +16,19 @@
 
 #include "capture.h"
 #include "encoder.h"
+#include "identity.h"
 #include "inject.h"
 #include "protocol.h"
 #include "session.h"
 
 namespace rdh {
+
+// Where "approved once, trusted from now on" devices are kept (implemented by the app).
+struct TrustStore {
+    virtual ~TrustStore() = default;
+    virtual bool IsTrusted(const rd::DeviceId& id) = 0;
+    virtual void Remember(const rd::DeviceId& id, const std::string& name) = 0;
+};
 
 struct HostConfig {
     std::string listenIp = "0.0.0.0";
@@ -30,6 +38,7 @@ struct HostConfig {
     std::array<uint8_t, rd::kKeyLen> psk{};
     bool requireApproval = true;  // hold video until the local user clicks Allow
     bool allowControl = true;     // accept mouse/keyboard input from the (approved) viewer
+    TrustStore* trust = nullptr;  // devices that skip the approval prompt; may be null
 };
 
 struct HostStatus {
@@ -37,17 +46,21 @@ struct HostStatus {
     std::atomic<int> state{Stopped};
     std::atomic<float> fps{0}, mbps{0};
     std::atomic<bool> approve{false}, deny{false}, kick{false};
+    std::atomic<bool> remember{false};      // the user chose "Always allow this device"
     std::atomic<bool> controlling{false};  // the viewer has used mouse/keyboard in the last 2 s
 
     void SetText(std::string& dst, const std::string& v) { std::lock_guard<std::mutex> l(m_); dst = v; }
     std::string Peer() { std::lock_guard<std::mutex> l(m_); return peer_; }
     std::string Error() { std::lock_guard<std::mutex> l(m_); return error_; }
     void SetPeer(const std::string& v) { SetText(peer_, v); }
+    std::string PeerName() { std::lock_guard<std::mutex> l(m_); return peerName_; }
+    void SetPeerName(const std::string& v) { SetText(peerName_, v); }
+    bool PeerKnown() { std::lock_guard<std::mutex> l(m_); return !peerName_.empty(); }
     void SetError(const std::string& v) { SetText(error_, v); }
 
 private:
     std::mutex m_;
-    std::string peer_, error_;
+    std::string peer_, error_, peerName_;
 };
 
 namespace detail {
@@ -182,10 +195,13 @@ inline void RunHost(const HostConfig& cfg, std::atomic<bool>& stop, HostStatus& 
     uint32_t frameId = 0;
     std::vector<uint8_t> packet;
     uint64_t statStart = NowUs(), statBytes = 0, statFrames = 0, lastHs = 0, blockUntil = 0;
-    // A client the user approved may re-pair (network blip, restart) from the same IP within this
-    // window without a new prompt. Kick/deny clears it.
-    constexpr uint64_t kApprovalGraceUs = 120'000'000;
-    std::string peerIp, approvedIp;
+    // A client the user approved may re-pair (network blip) from the same IP within this short window
+    // without a new prompt. Devices the user chose to trust are remembered for good (cfg.trust).
+    // Kick/deny clears the grace.
+    constexpr uint64_t kApprovalGraceUs = 20'000'000;
+    std::string peerIp, approvedIp, peerName;
+    rd::DeviceId peerDev{};
+    bool haveDev = false;  // the viewer proved which device it is (Identify)
     uint64_t approvedAt = 0, lastKeepalive = 0, lastControlUs = 0, lastCursorSend = 0;
     uint32_t inputNext = 0;  // next reliable input sequence number we expect from the viewer
     bool cursorSendNow = false;
@@ -198,6 +214,10 @@ inline void RunHost(const HostConfig& cfg, std::atomic<bool>& stop, HostStatus& 
         if (blockMs > 0) approvedIp.clear();  // kicked or denied: forget the approval
         blockUntil = NowUs() + blockMs * 1000;
         inject.ReleaseAll();  // never leave keys or mouse buttons stuck down
+        haveDev = false;
+        peerName.clear();
+        st.SetPeerName("");
+        st.remember = false;
         st.controlling = false;
         st.fps = 0;
         st.mbps = 0;
@@ -212,6 +232,7 @@ inline void RunHost(const HostConfig& cfg, std::atomic<bool>& stop, HostStatus& 
             if (st.approve.exchange(false)) {
                 st.state = HostStatus::Streaming;
                 approvedIp = peerIp;
+                if (st.remember.exchange(false) && haveDev && cfg.trust) cfg.trust->Remember(peerDev, peerName);
                 forceKey = true;
             } else if (st.deny.exchange(false)) {
                 dropClient(30'000);
@@ -264,7 +285,22 @@ inline void RunHost(const HostConfig& cfg, std::atomic<bool>& stop, HostStatus& 
                 cursorSendNow = true;
                 peerIp = detail::IpOnly(from);
                 st.SetPeer(detail::AddrToString(from));
-                const bool preApproved = !cfg.requireApproval ||
+                // Which device is this? The first packet of a viewer is its signed Identify.
+                haveDev = false;
+                peerName.clear();
+                st.SetPeerName("");
+                st.remember = false;
+                if (pl >= sizeof(rd::PacketHeader)) {
+                    rd::PacketHeader fh;
+                    memcpy(&fh, plain, sizeof(fh));
+                    if (fh.magic == rd::kMagic && fh.type == uint8_t(rd::PacketType::Identify) &&
+                        rd::ParseIdentify(plain + sizeof(fh), pl - sizeof(fh), active, peerDev, peerName)) {
+                        haveDev = true;
+                        st.SetPeerName(peerName.empty() ? "unnamed device" : peerName);
+                    }
+                }
+                const bool trustedDevice = haveDev && cfg.trust && cfg.trust->IsTrusted(peerDev);
+                const bool preApproved = !cfg.requireApproval || trustedDevice ||
                                          (peerIp == approvedIp && NowUs() - approvedAt < kApprovalGraceUs);
                 if (preApproved) {
                     approvedIp = peerIp;
@@ -284,6 +320,16 @@ inline void RunHost(const HostConfig& cfg, std::atomic<bool>& stop, HostStatus& 
             peer.lastSeenUs = NowUs();
             if (h.type == uint8_t(rd::PacketType::KeyReq)) {
                 forceKey = true;
+            } else if (h.type == uint8_t(rd::PacketType::Identify)) {
+                if (!haveDev && rd::ParseIdentify(plain + sizeof(h), pl - sizeof(h), active, peerDev, peerName)) {
+                    haveDev = true;
+                    st.SetPeerName(peerName.empty() ? "unnamed device" : peerName);
+                    if (st.state == HostStatus::AwaitingApproval && cfg.trust && cfg.trust->IsTrusted(peerDev)) {
+                        approvedIp = peerIp;  // a trusted device: no need to ask
+                        st.state = HostStatus::Streaming;
+                        forceKey = true;
+                    }
+                }
             } else if (h.type == uint8_t(rd::PacketType::InputMove) || h.type == uint8_t(rd::PacketType::Input)) {
                 // Input only counts after the local user approved this viewer AND allows control.
                 if (st.state != HostStatus::Streaming || !cfg.allowControl) continue;
