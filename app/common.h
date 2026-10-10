@@ -215,6 +215,32 @@ inline void Log(const std::wstring& path, const char* fmt, ...) {
     CloseHandle(h);
 }
 
+// "Start with Windows" for the current user only: a value in HKCU\...\Run. No administrator
+// rights are needed and it can be removed any time from Settings > Apps > Startup.
+inline std::wstring SelfPath() {
+    wchar_t p[MAX_PATH * 2] = {};
+    GetModuleFileNameW(nullptr, p, DWORD(std::size(p)));
+    return p;
+}
+constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+constexpr wchar_t kRunValue[] = L"RemoteDisplay";
+
+inline bool IsStartupEnabled() {
+    wchar_t buf[MAX_PATH * 2] = {};
+    DWORD size = sizeof(buf);
+    return RegGetValueW(HKEY_CURRENT_USER, kRunKey, kRunValue, RRF_RT_REG_SZ, nullptr, buf, &size) == ERROR_SUCCESS;
+}
+
+inline bool SetStartupEnabled(bool on) {
+    if (!on) {
+        LSTATUS r = RegDeleteKeyValueW(HKEY_CURRENT_USER, kRunKey, kRunValue);
+        return r == ERROR_SUCCESS || r == ERROR_FILE_NOT_FOUND;
+    }
+    const std::wstring cmd = L"\"" + SelfPath() + L"\" --background";
+    return RegSetKeyValueW(HKEY_CURRENT_USER, kRunKey, kRunValue, REG_SZ, cmd.c_str(),
+                           DWORD((cmd.size() + 1) * sizeof(wchar_t))) == ERROR_SUCCESS;
+}
+
 inline std::wstring UserDataDir() {
     wchar_t appdata[MAX_PATH] = {};
     GetEnvironmentVariableW(L"APPDATA", appdata, MAX_PATH);

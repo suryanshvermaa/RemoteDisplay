@@ -47,7 +47,8 @@ the host serves one client at a time, and new-handshake requests are rate-limite
 - `service/src/host.h`: `RunHost()` capture -> encode -> send, stoppable, reports `HostStatus`
   (approval gate, disconnect, 1 s encrypted keepalive, same-IP re-pair grace of 2 minutes).
 - `client/src/viewer.h`: `Viewer` window + network/decode thread.
-- `app/main.cpp`: the GUI (`RemoteDisplay.exe`) combining both.
+- `app/main.cpp`: the GUI (`RemoteDisplay.exe`) combining both, plus the tray icon, close-to-tray,
+  single-instance rule and `--background` (hidden, auto-share) mode used by the startup entry.
 - `app/service.h`: install/uninstall (elevated helper), and the service that supervises the worker.
 - `app/worker.h`: `--host-worker`, the headless host in the user session; approval prompt, log.
 - `app/shared.h`: same-user IPC (shared-memory status, kick event, "host active" lock).

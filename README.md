@@ -35,7 +35,25 @@ pairing key can be regenerated at any time. The status line says "viewing" or "c
 
 Command-line tools for testing and headless use: `rd-host.exe` and `rd-client.exe`.
 
-## Run in the background (Windows service)
+## Run it hidden in the background
+
+There are three ways to run RemoteDisplay on the PC you want to share. Pick one:
+
+| | Window | Admin needed | Starts | Best for |
+|---|---|---|---|---|
+| **Normal app** | yes | no | when you open it | trying it out |
+| **Start with Windows** (tray) | hidden, tray icon only | no | when you sign in | most people, like Parsec/AnyDesk |
+| **Windows service** | none | once, to install | when Windows boots (shares once you are signed in) | always-on PCs |
+
+**Start with Windows (recommended):** tick **Start with Windows** under *Run in background*. It
+adds a per-user startup entry (`RemoteDisplay.exe --background`), so after you sign in the app starts
+with **no window on screen**, begins sharing, and puts a small icon in the system tray (grey = not
+sharing, green = sharing, amber = someone connecting or connected). Click the icon to open the window,
+right-click for *Start/Stop sharing, Disconnect viewer, Exit*. Closing the window while sharing just
+hides it to the tray. Only one copy runs per user: launching it again brings the running one forward.
+Untick the box (or Settings > Apps > Startup) to undo it.
+
+### Windows service (optional, needs admin)
 
 In the **Background service** section of the sharing card, click **Install** (Windows asks for
 administrator approval). That installs `RemoteDisplayHost`, which starts with Windows, adds a

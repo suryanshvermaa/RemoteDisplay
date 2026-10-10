@@ -5,6 +5,7 @@
 #include <windowsx.h>
 #include <iphlpapi.h>
 #include <commctrl.h>
+#include <shellapi.h>
 #include <wincrypt.h>
 
 #include <algorithm>
@@ -36,9 +37,11 @@ enum Ctl {
     IDC_IPS = 100, IDC_COPY_IP, IDC_KEY, IDC_COPY_KEY, IDC_NEW_KEY, IDC_APPROVE, IDC_SHARE, IDC_STATUS,
     IDC_DISCONNECT, IDC_REMOTE, IDC_REMOTE_KEY, IDC_CONNECT, IDC_MSG, IDC_HINT,
     IDC_LBL_ADDR, IDC_LBL_KEY, IDC_LBL_RADDR, IDC_LBL_RKEY, IDC_TITLE_L, IDC_TITLE_R,
-    IDC_SVC_TITLE, IDC_SVC_STATUS, IDC_SVC_BTN, IDC_SVC_HINT, IDC_CONTROL,
+    IDC_SVC_TITLE, IDC_SVC_STATUS, IDC_SVC_BTN, IDC_SVC_HINT, IDC_CONTROL, IDC_AUTOSTART,
 };
-constexpr UINT kMsgViewerClosed = WM_APP + 10, kMsgSvcDone = WM_APP + 11;
+enum TrayCmd { IDM_OPEN = 2001, IDM_TOGGLE, IDM_DISCONNECT, IDM_EXIT };
+constexpr UINT kMsgViewerClosed = WM_APP + 10, kMsgSvcDone = WM_APP + 11, kMsgTray = WM_APP + 20,
+               kMsgShow = WM_APP + 21;
 constexpr UINT_PTR kTimerUi = 1, kTimerCopied = 2;
 
 constexpr COLORREF kBg = RGB(238, 241, 245), kCard = RGB(255, 255, 255), kBorder = RGB(217, 222, 231),
@@ -46,9 +49,60 @@ constexpr COLORREF kBg = RGB(238, 241, 245), kCard = RGB(255, 255, 255), kBorder
                    kRed = RGB(220, 38, 38), kAmber = RGB(217, 119, 6), kText = RGB(31, 41, 55),
                    kMuted = RGB(107, 114, 128);
 
+// Draws the app icon at any size: navy tile, white monitor, optional status dot in the corner.
+HICON MakeIcon(int n, COLORREF dot, bool showDot) {
+    BITMAPV5HEADER bi = {};
+    bi.bV5Size = sizeof(bi);
+    bi.bV5Width = n;
+    bi.bV5Height = -n;
+    bi.bV5Planes = 1;
+    bi.bV5BitCount = 32;
+    bi.bV5Compression = BI_BITFIELDS;
+    bi.bV5RedMask = 0x00FF0000;
+    bi.bV5GreenMask = 0x0000FF00;
+    bi.bV5BlueMask = 0x000000FF;
+    bi.bV5AlphaMask = 0xFF000000;
+    void* bits = nullptr;
+    HBITMAP color = CreateDIBSection(nullptr, reinterpret_cast<BITMAPINFO*>(&bi), DIB_RGB_COLORS, &bits, nullptr, 0);
+    HBITMAP mask = CreateBitmap(n, n, 1, 1, nullptr);
+    if (!color || !mask || !bits) return nullptr;
+    auto argb = [](COLORREF c) { return 0xFF000000u | (uint32_t(GetRValue(c)) << 16) | (uint32_t(GetGValue(c)) << 8) | GetBValue(c); };
+    const double r = n * 0.22, t = std::max(1.0, n / 14.0);
+    const double L = n * 0.17, T = n * 0.2, R = n * 0.83, B = n * 0.62;
+    auto* px = static_cast<uint32_t*>(bits);
+    for (int y = 0; y < n; ++y) {
+        for (int x = 0; x < n; ++x) {
+            const double fx = x + 0.5, fy = y + 0.5;
+            uint32_t out = 0;
+            const double cx = std::clamp(fx, r, n - r), cy = std::clamp(fy, r, n - r);
+            if (std::hypot(fx - cx, fy - cy) <= r) {
+                out = argb(kNavy);
+                const bool outer = fx >= L && fx <= R && fy >= T && fy <= B;
+                const bool inner = fx >= L + t && fx <= R - t && fy >= T + t && fy <= B - t;
+                if (inner) out = argb(kAccent);
+                else if (outer) out = argb(RGB(255, 255, 255));
+                if ((fx >= n * 0.42 && fx <= n * 0.58 && fy > B && fy <= n * 0.74) ||
+                    (fx >= n * 0.3 && fx <= n * 0.7 && fy > n * 0.74 && fy <= n * 0.8))
+                    out = argb(RGB(255, 255, 255));
+            }
+            if (showDot) {
+                const double d = std::hypot(fx - n * 0.75, fy - n * 0.72);
+                if (d <= n * 0.27) out = argb(RGB(255, 255, 255));
+                if (d <= n * 0.2) out = argb(dot);
+            }
+            px[size_t(y) * n + x] = out;
+        }
+    }
+    ICONINFO ii = {TRUE, 0, 0, mask, color};
+    HICON icon = CreateIconIndirect(&ii);
+    DeleteObject(color);
+    DeleteObject(mask);
+    return icon;
+}
+
 class App {
 public:
-    static int Run(HINSTANCE inst) {
+    static int Run(HINSTANCE inst, bool background) {
         WSADATA wsa;
         WSAStartup(MAKEWORD(2, 2), &wsa);
         timeBeginPeriod(1);
@@ -61,20 +115,24 @@ public:
         wc.hInstance = inst;
         wc.lpszClassName = L"RemoteDisplayApp";
         wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-        wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
         RegisterClassW(&wc);
 
         App app;
         app.inst_ = inst;
+        app.background_ = background;
         app.dpi_ = GetDeviceCaps(GetDC(nullptr), LOGPIXELSX);
-        RECT rc = {0, 0, app.S(820), app.S(572)};
+        RECT rc = {0, 0, app.S(820), app.S(570)};
         AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
         HWND h = CreateWindowW(L"RemoteDisplayApp", L"RemoteDisplay",
                                WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN,
                                CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top, nullptr,
                                nullptr, inst, &app);
         if (!h) return 1;
-        ShowWindow(h, SW_SHOW);
+        HICON big = MakeIcon(GetSystemMetrics(SM_CXICON), kGreen, false);
+        HICON smallIcon = MakeIcon(GetSystemMetrics(SM_CXSMICON), kGreen, false);
+        SendMessage(h, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(big));
+        SendMessage(h, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(smallIcon));
+        ShowWindow(h, background ? SW_HIDE : SW_SHOW);  // started with Windows: tray only, no window
         MSG msg;
         while (GetMessageW(&msg, nullptr, 0, 0)) {
             if (!IsDialogMessageW(h, &msg)) {
@@ -138,11 +196,10 @@ private:
         Add(L"BUTTON", L"Disconnect", BS_PUSHBUTTON | WS_TABSTOP, 276, 412, 88, 24, IDC_DISCONNECT);
 
         // ---- background service (bottom of the left card)
-        Add(L"STATIC", L"BACKGROUND SERVICE", SS_LEFT, 44, 452, 200, 16, IDC_SVC_TITLE);
-        Add(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS, 44, 474, 190, 22, IDC_SVC_STATUS);
-        Add(L"BUTTON", L"Install", BS_PUSHBUTTON | WS_TABSTOP, 244, 470, 120, 28, IDC_SVC_BTN);
-        Add(L"STATIC", L"Starts with Windows - stays shareable after a reboot.",
-            SS_LEFT, 44, 502, 320, 18, IDC_SVC_HINT);
+        Add(L"STATIC", L"RUN IN BACKGROUND", SS_LEFT, 44, 444, 200, 16, IDC_SVC_TITLE);
+        Add(L"BUTTON", L"Start with Windows (tray icon, no admin needed)", BS_AUTOCHECKBOX | WS_TABSTOP, 44, 464, 320, 24, IDC_AUTOSTART);
+        Add(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS, 44, 496, 196, 22, IDC_SVC_STATUS);
+        Add(L"BUTTON", L"Install", BS_PUSHBUTTON | WS_TABSTOP, 244, 492, 120, 28, IDC_SVC_BTN);
 
         // ---- right card: connect
         Add(L"STATIC", L"REMOTE PC", SS_LEFT, 436, 108, 200, 16, IDC_LBL_RADDR + 100);
@@ -170,8 +227,77 @@ private:
             SendMessage(Ctrl(IDC_REMOTE), CB_SETCURSEL, 0, 0);
             FillRemoteKey(0);
         }
+        CheckDlgButton(hwnd_, IDC_AUTOSTART, IsStartupEnabled() ? BST_CHECKED : BST_UNCHECKED);
+        taskbarCreated_ = RegisterWindowMessageW(L"TaskbarCreated");  // Explorer restarted: re-add the icon
+        for (int i = 0; i < 3; ++i) {
+            const COLORREF cols[3] = {RGB(156, 163, 175), kGreen, kAmber};
+            trayIcons_[i] = MakeIcon(GetSystemMetrics(SM_CXSMICON), cols[i], true);
+        }
         SetTimer(hwnd_, kTimerUi, 250, nullptr);
         UpdateUi();
+        AddTray();
+        if (background_ && svcState_ != SvcState::Running && !Sharing()) {  // started with Windows: just start sharing
+            ToggleSharing();
+            Balloon(L"RemoteDisplay is running", L"Sharing is on. Open it from the tray icon.");
+        }
+    }
+
+    // ---- tray icon ------------------------------------------------------------------------
+    NOTIFYICONDATAW TrayData(UINT flags) {
+        NOTIFYICONDATAW nid = {sizeof(nid)};
+        nid.hWnd = hwnd_;
+        nid.uID = 1;
+        nid.uFlags = flags;
+        nid.uCallbackMessage = kMsgTray;
+        nid.hIcon = trayIcons_[trayState_];
+        wcsncpy_s(nid.szTip, trayTip_.c_str(), _TRUNCATE);
+        return nid;
+    }
+    void AddTray() {
+        NOTIFYICONDATAW nid = TrayData(NIF_ICON | NIF_MESSAGE | NIF_TIP);
+        trayAdded_ = Shell_NotifyIconW(NIM_ADD, &nid) != FALSE;
+    }
+    void RemoveTray() {
+        if (!trayAdded_) return;
+        NOTIFYICONDATAW nid = TrayData(0);
+        Shell_NotifyIconW(NIM_DELETE, &nid);
+        trayAdded_ = false;
+    }
+    void UpdateTray(int state, const std::wstring& tip) {
+        if (state == trayState_ && tip == trayTip_) return;
+        trayState_ = state;
+        trayTip_ = tip;
+        if (!trayAdded_) return;
+        NOTIFYICONDATAW nid = TrayData(NIF_ICON | NIF_TIP);
+        Shell_NotifyIconW(NIM_MODIFY, &nid);
+    }
+    void Balloon(const wchar_t* title, const wchar_t* text) {
+        if (!trayAdded_) return;
+        NOTIFYICONDATAW nid = TrayData(NIF_INFO);
+        wcsncpy_s(nid.szInfoTitle, title, _TRUNCATE);
+        wcsncpy_s(nid.szInfo, text, _TRUNCATE);
+        nid.dwInfoFlags = NIIF_INFO | NIIF_NOSOUND;
+        Shell_NotifyIconW(NIM_MODIFY, &nid);
+    }
+    void ShowMain() {
+        ShowWindow(hwnd_, IsIconic(hwnd_) ? SW_RESTORE : SW_SHOW);
+        SetForegroundWindow(hwnd_);
+    }
+    void ShowTrayMenu() {
+        const View v = CurrentView();
+        HMENU m = CreatePopupMenu();
+        AppendMenuW(m, MF_STRING, IDM_OPEN, L"Open RemoteDisplay");
+        AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(m, MF_STRING | (v.viaService ? MF_GRAYED : 0), IDM_TOGGLE, Sharing() ? L"Stop sharing" : L"Start sharing");
+        AppendMenuW(m, MF_STRING | (v.state == rdh::HostStatus::Streaming ? 0 : MF_GRAYED), IDM_DISCONNECT, L"Disconnect viewer");
+        AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(m, MF_STRING, IDM_EXIT, L"Exit");
+        POINT pt;
+        GetCursorPos(&pt);
+        SetForegroundWindow(hwnd_);  // required so the menu closes when you click elsewhere
+        TrackPopupMenu(m, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, pt.x, pt.y, 0, hwnd_, nullptr);
+        PostMessage(hwnd_, WM_NULL, 0, 0);
+        DestroyMenu(m);
     }
 
     void FillRemoteKey(size_t i) {
@@ -320,14 +446,22 @@ private:
         EnableWindow(Ctrl(IDC_SHARE), !v.viaService);
         InvalidateRect(Ctrl(IDC_SHARE), nullptr, FALSE);
 
+        // tray: grey = not sharing, green = sharing, amber = someone is connecting/connected
+        {
+            std::wstring text = status;
+            if (!text.empty() && text[0] == L'\u25CF') text = text.substr(2);
+            const int ts = (connected || s == rdh::HostStatus::AwaitingApproval) ? 2 : (sharing || v.viaService) ? 1 : 0;
+            UpdateTray(ts, L"RemoteDisplay - " + text);
+        }
+
         // background-service section
         std::wstring ss, btn;
         COLORREF sc = kMuted;
         switch (svcState_) {
-            case SvcState::NotInstalled: ss = L"Not installed"; btn = L"Install"; break;
-            case SvcState::Running: ss = L"● Installed and running"; btn = L"Remove"; sc = kGreen; break;
-            case SvcState::Stopped: ss = L"● Installed, not running"; btn = L"Remove"; sc = kAmber; break;
-            case SvcState::Transition: ss = L"Changing state..."; btn = L"Remove"; sc = kAmber; break;
+            case SvcState::NotInstalled: ss = L"Windows service: not installed"; btn = L"Install service"; break;
+            case SvcState::Running: ss = L"● Windows service: running"; btn = L"Remove service"; sc = kGreen; break;
+            case SvcState::Stopped: ss = L"● Windows service: stopped"; btn = L"Remove service"; sc = kAmber; break;
+            case SvcState::Transition: ss = L"Windows service: changing..."; btn = L"Remove service"; sc = kAmber; break;
         }
         if (!svcBusy_) {
             svcColor_ = sc;
@@ -345,12 +479,13 @@ private:
         if (!Sharing() || host_.state != rdh::HostStatus::AwaitingApproval) { promptShown_ = false; return; }
         if (promptShown_) return;
         promptShown_ = true;
-        if (IsIconic(hwnd_)) ShowWindow(hwnd_, SW_RESTORE);
-        SetForegroundWindow(hwnd_);
+        const bool visible = IsWindowVisible(hwnd_) != FALSE;
+        if (visible && IsIconic(hwnd_)) ShowWindow(hwnd_, SW_RESTORE);
+        if (visible) SetForegroundWindow(hwnd_);
         std::wstring msg = W(host_.Peer()) + (hostCfg_.allowControl ? L" has your pairing key and wants to view and control your screen."
                                                               : L" has your pairing key and wants to view your screen.") +
                            L"\n\nAllow this connection?";
-        int r = MessageBoxW(hwnd_, msg.c_str(), L"RemoteDisplay - connection request",
+        int r = MessageBoxW(visible ? hwnd_ : nullptr, msg.c_str(), L"RemoteDisplay - connection request",
                             MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2 | MB_SETFOREGROUND | MB_TOPMOST);
         if (host_.state == rdh::HostStatus::AwaitingApproval) {  // client may have left meanwhile
             if (r == IDYES) host_.approve = true; else host_.deny = true;
@@ -419,14 +554,14 @@ private:
         HBRUSH card = CreateSolidBrush(kCard);
         SelectObject(mem, pen);
         SelectObject(mem, card);
-        RoundRect(mem, S(24), S(96), S(404), S(532), S(14), S(14));
-        RoundRect(mem, S(416), S(96), S(796), S(532), S(14), S(14));
+        RoundRect(mem, S(24), S(96), S(404), S(534), S(14), S(14));
+        RoundRect(mem, S(416), S(96), S(796), S(534), S(14), S(14));
         DeleteObject(pen);
         DeleteObject(card);
 
         SetTextColor(mem, kMuted);
         SelectObject(mem, fontSmall_);
-        TextOutW(mem, S(26), S(544), L"AES-128-GCM encrypted. Connections need your pairing key.", 56);
+        TextOutW(mem, S(26), S(546), L"AES-128-GCM encrypted. Connections need your pairing key.", 56);
 
         BitBlt(dc, 0, 0, cr.right, cr.bottom, mem, 0, 0, SRCCOPY);
         SelectObject(mem, old);
@@ -485,6 +620,11 @@ private:
     }
 
     LRESULT Handle(HWND h, UINT m, WPARAM w, LPARAM l) {
+        if (taskbarCreated_ && m == taskbarCreated_) {
+            trayAdded_ = false;
+            AddTray();
+            return 0;
+        }
         switch (m) {
             case WM_CREATE: OnCreate(); return 0;
             case WM_ERASEBKGND: return 1;
@@ -518,8 +658,46 @@ private:
                     SetText(IDC_COPY_KEY, L"Copy");
                 }
                 return 0;
+            case kMsgTray:
+                if (LOWORD(l) == WM_LBUTTONUP || LOWORD(l) == WM_LBUTTONDBLCLK) ShowMain();
+                else if (LOWORD(l) == WM_RBUTTONUP) ShowTrayMenu();
+                return 0;
+            case kMsgShow:
+                ShowMain();
+                return 0;
+            case WM_CLOSE:
+                // Closing the window while sharing keeps sharing, from the tray (Exit is in its menu).
+                if (!forceExit_ && Sharing()) {
+                    ShowWindow(h, SW_HIDE);
+                    if (!tipShown_) {
+                        tipShown_ = true;
+                        Balloon(L"RemoteDisplay is still running", L"Sharing continues from the tray. Right-click the icon to exit.");
+                    }
+                    return 0;
+                }
+                DestroyWindow(h);
+                return 0;
             case WM_COMMAND:
                 switch (LOWORD(w)) {
+                    case IDM_OPEN: ShowMain(); break;
+                    case IDM_TOGGLE: ToggleSharing(); break;
+                    case IDM_DISCONNECT:
+                        if (CurrentView().viaService) StatusReader::Kick(); else host_.kick = true;
+                        break;
+                    case IDM_EXIT:
+                        forceExit_ = true;
+                        DestroyWindow(h);
+                        break;
+                    case IDC_AUTOSTART: {
+                        const bool on = IsDlgButtonChecked(h, IDC_AUTOSTART) == BST_CHECKED;
+                        if (!SetStartupEnabled(on)) {
+                            CheckDlgButton(h, IDC_AUTOSTART, on ? BST_UNCHECKED : BST_CHECKED);
+                            Message(L"Could not change the startup setting.");
+                        } else {
+                            Message(on ? L"RemoteDisplay will start sharing when you sign in." : L"Will no longer start with Windows.", kMuted);
+                        }
+                        break;
+                    }
                     case IDC_SHARE: ToggleSharing(); break;
                     case IDC_CONNECT: Connect(); break;
                     case IDC_DISCONNECT:
@@ -579,6 +757,7 @@ private:
             }
             case WM_DESTROY:
                 KillTimer(h, kTimerUi);
+                RemoveTray();
                 viewers_.clear();
                 StopSharing();
                 if (svcThread_.joinable()) svcThread_.join();
@@ -601,6 +780,12 @@ private:
     unsigned tick_ = 0;
     HostActiveLock ownLock_;
 
+    bool background_ = false, forceExit_ = false, tipShown_ = false, trayAdded_ = false;
+    UINT taskbarCreated_ = 0;
+    HICON trayIcons_[3] = {};
+    int trayState_ = 0;
+    std::wstring trayTip_ = L"RemoteDisplay";
+
     std::unique_ptr<Config> cfg_;
     std::vector<Recent> recents_;
 
@@ -620,9 +805,26 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     const std::wstring mode = argc > 1 ? argv[1] : L"";
     const std::wstring arg2 = argc > 2 ? argv[2] : L"";
+    bool background = false, multiple = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::wstring(argv[i]) == L"--background") background = true;
+        if (std::wstring(argv[i]) == L"--allow-multiple") multiple = true;
+    }
     if (argv) LocalFree(argv);
     if (mode == L"--service") return RunServiceMain();        // started by the Service Control Manager
     if (mode == L"--host-worker") return RunWorker();         // started by the service, in the user session
     if (mode == L"--service-ctl") return ServiceControl(arg2);  // elevated helper: install/uninstall/start/stop
-    return App::Run(inst);
+
+    // One app per user session: a second launch just brings the first one to the front.
+    HANDLE single = nullptr;
+    if (!multiple) {
+        single = CreateMutexW(nullptr, FALSE, L"Local\\RemoteDisplayApp");
+        if (single && GetLastError() == ERROR_ALREADY_EXISTS) {
+            if (!background) {
+                if (HWND existing = FindWindowW(L"RemoteDisplayApp", nullptr)) PostMessage(existing, kMsgShow, 0, 0);
+            }
+            return 0;
+        }
+    }
+    return App::Run(inst, background);
 }
