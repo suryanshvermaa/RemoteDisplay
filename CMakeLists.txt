@@ -20,3 +20,7 @@ target_include_directories(test-session PRIVATE service/include)
 target_link_libraries(test-session PRIVATE bcrypt)
 enable_testing()
 add_test(NAME session COMMAND test-session)
+
+add_executable(RemoteDisplay WIN32 app/main.cpp)
+target_include_directories(RemoteDisplay PRIVATE service/include service/src client/src)
+target_link_libraries(RemoteDisplay PRIVATE ${MF_LIBS} user32 gdi32 bcrypt crypt32 iphlpapi comctl32)
