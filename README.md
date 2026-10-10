@@ -22,8 +22,16 @@ ask to allow the app on private networks: allow it.
 **On the PC you are sitting at:** type the other PC's address and pairing key, click **Connect**. A
 viewer window opens (F11 toggles fullscreen). Recent connections are remembered.
 
+**Controlling the remote PC:** click inside the viewer and use your mouse, wheel and keyboard as
+normal. The cursor you see is the remote PC's own cursor shape. The Windows key, Alt+Tab, Alt+Esc
+and Ctrl+Esc go to the remote PC while the viewer is focused. Keys are sent as hardware scancodes,
+so the remote PC's keyboard layout decides the characters. Keys and mouse buttons are released on
+the remote PC if the viewer loses focus, closes or disconnects. Because you can open Windows
+Settings and other apps this way, you can change the remote PC's settings.
+
 The sharing PC gets an "Allow this connection?" prompt for each new client (can be turned off), a
-Disconnect button, and the pairing key can be regenerated at any time.
+Disconnect button, an **Allow mouse and keyboard control** switch (off = view only), and the
+pairing key can be regenerated at any time. The status line says "viewing" or "controlling".
 
 Command-line tools for testing and headless use: `rd-host.exe` and `rd-client.exe`.
 
@@ -57,7 +65,10 @@ Logs: `%ProgramData%\RemoteDisplay\service.log` and `%APPDATA%\RemoteDisplay\wor
 
 ## Current limits
 
-- **View only**: no mouse/keyboard control yet.
+- **Elevated windows**: input cannot reach admin (UAC-elevated) windows, UAC prompts, the lock screen
+  or Ctrl+Alt+Del; that needs a SYSTEM-level helper (not built yet).
+- No clipboard or file transfer, no audio; characters typed with an IME or dead keys are not
+  forwarded as text (keys are sent by scancode).
 - **Same network or a reachable address**: no relay or NAT traversal yet, so over the internet you
   need a port-forward (UDP 47800) or a VPN such as Tailscale/WireGuard.
 - One viewer at a time; primary monitor only; no audio or clipboard.

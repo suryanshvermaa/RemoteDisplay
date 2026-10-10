@@ -1,5 +1,5 @@
 // rd-host: headless host (CLI). The GUI app (RemoteDisplay.exe) uses the same RunHost().
-//   rd-host [--listen <ip>] [--port <n>] [--fps <n>] [--mbps <n>] [--key <pairing-key>]
+//   rd-host [--listen <ip>] [--port <n>] [--fps <n>] [--mbps <n>] [--key <pairing-key>] [--control 0|1]
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -21,6 +21,7 @@ int main(int argc, char** argv) {
         else if (a == "--fps") cfg.fps = atoi(argv[i + 1]);
         else if (a == "--mbps") cfg.mbps = atoi(argv[i + 1]);
         else if (a == "--key") keyText = argv[i + 1];
+        else if (a == "--control") cfg.allowControl = atoi(argv[i + 1]) != 0;  // 0 = view only
     }
     if (keyText.empty()) {
         rd::crypto::Random(cfg.psk.data(), cfg.psk.size());

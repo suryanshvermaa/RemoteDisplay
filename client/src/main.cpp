@@ -21,6 +21,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
                     "rd-client", MB_ICONERROR);
         return 1;
     }
+    SetProcessDPIAware();  // real pixels: sharp picture, and pointer mapping matches the window
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
     timeBeginPeriod(1);

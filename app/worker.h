@@ -33,7 +33,9 @@ inline int RunWorker() {
     hc.listenIp = "0.0.0.0";
     hc.psk = cfg.HostKey();
     hc.requireApproval = cfg.RequireApproval();
-    Log(log, "listening on UDP %d, approval %s", hc.port, hc.requireApproval ? "required" : "not required");
+    hc.allowControl = cfg.AllowControl();
+    Log(log, "listening on UDP %d, approval %s, control %s", hc.port, hc.requireApproval ? "required" : "not required",
+        hc.allowControl ? "allowed" : "view only");
 
     StatusWriter status;
     if (!status.Create()) Log(log, "could not create shared status (GUI will not see this worker)");
@@ -64,7 +66,9 @@ inline int RunWorker() {
                 prompting = true;
                 const std::string peer = st.Peer();
                 prompt = std::thread([&, peer] {
-                    std::wstring msg = W(peer) + L" has your pairing key and wants to view your screen.\n\nAllow this connection?";
+                    std::wstring msg = W(peer) + (hc.allowControl ? L" has your pairing key and wants to view and control your screen."
+                                                     : L" has your pairing key and wants to view your screen.") +
+                                       L"\n\nAllow this connection?";
                     int r = MessageBoxW(nullptr, msg.c_str(), L"RemoteDisplay - connection request",
                                         MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2 | MB_SETFOREGROUND | MB_TOPMOST);
                     if (st.state == rdh::HostStatus::AwaitingApproval) {  // client may have left meanwhile

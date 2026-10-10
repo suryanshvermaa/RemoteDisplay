@@ -24,6 +24,7 @@ struct SharedStatus {
     float fps;
     float mbps;
     uint32_t pid;
+    uint32_t controlling;  // viewer used mouse/keyboard recently
     uint64_t heartbeatMs;  // GetTickCount64() at last update
     char peer[48];
     char error[96];
@@ -78,6 +79,7 @@ public:
         s.fps = st.fps;
         s.mbps = st.mbps;
         s.pid = GetCurrentProcessId();
+        s.controlling = st.controlling ? 1 : 0;
         s.heartbeatMs = GetTickCount64();
         strncpy_s(s.peer, st.Peer().c_str(), _TRUNCATE);
         strncpy_s(s.error, st.Error().c_str(), _TRUNCATE);

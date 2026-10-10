@@ -30,6 +30,18 @@ packet, sliding-window replay protection. A client with the wrong key never gets
 Known limits: a 128-bit key must be copied by hand (a short-code PAKE is a later improvement),
 the host serves one client at a time, and new-handshake requests are rate-limited but unauthenticated.
 
+## Input and cursor
+
+- Viewer to host: `Input` (reliable: buttons, wheel, keys; consecutive sequence numbers, host acks
+  `InputAck`, viewer resends the unacked window every 30 ms, host applies strictly in order and
+  ignores duplicates) and `InputMove` (unreliable, newest position wins). Positions are normalised
+  0..65535 over the picture, so window size and letterboxing do not matter. The host injects with
+  `SendInput` (`service/src/inject.h`) and releases everything it pressed if the viewer goes away.
+- Input is accepted only in the Streaming state (i.e. after approval) and only if control is allowed.
+- Host to viewer: the captured picture has no pointer, so the cursor shape is sent as `Cursor`
+  fragments (on change, to new viewers, and every 2 s) and shown as the viewer's local cursor, which
+  keeps it lag-free. Cursor-only updates no longer cost a video frame.
+
 ## Components
 
 - `service/src/host.h`: `RunHost()` capture -> encode -> send, stoppable, reports `HostStatus`
@@ -59,8 +71,8 @@ Windows boot -> RemoteDisplayHost (LocalSystem, Session 0)
 2. **Phase 2, internet**: DONE encryption + authentication. TODO signaling server, STUN + UDP hole
    punching, relay fallback, pacing of keyframe bursts, congestion control (bitrate adaptation
    from loss/RTT reports).
-3. **Phase 3**: input return channel (SendInput; SYSTEM service for UAC/secure desktop),
-   audio (WASAPI loopback + Opus), clipboard, multi-monitor, cursor as separate stream, FEC.
+3. **Phase 3**: DONE input return + cursor. TODO SYSTEM-level helper for elevated windows/UAC/lock
+   screen, audio (WASAPI loopback + Opus), clipboard, multi-monitor, FEC.
 
 ## Open question to verify in Phase 1
 

@@ -36,7 +36,7 @@ enum Ctl {
     IDC_IPS = 100, IDC_COPY_IP, IDC_KEY, IDC_COPY_KEY, IDC_NEW_KEY, IDC_APPROVE, IDC_SHARE, IDC_STATUS,
     IDC_DISCONNECT, IDC_REMOTE, IDC_REMOTE_KEY, IDC_CONNECT, IDC_MSG, IDC_HINT,
     IDC_LBL_ADDR, IDC_LBL_KEY, IDC_LBL_RADDR, IDC_LBL_RKEY, IDC_TITLE_L, IDC_TITLE_R,
-    IDC_SVC_TITLE, IDC_SVC_STATUS, IDC_SVC_BTN, IDC_SVC_HINT,
+    IDC_SVC_TITLE, IDC_SVC_STATUS, IDC_SVC_BTN, IDC_SVC_HINT, IDC_CONTROL,
 };
 constexpr UINT kMsgViewerClosed = WM_APP + 10, kMsgSvcDone = WM_APP + 11;
 constexpr UINT_PTR kTimerUi = 1, kTimerCopied = 2;
@@ -67,7 +67,7 @@ public:
         App app;
         app.inst_ = inst;
         app.dpi_ = GetDeviceCaps(GetDC(nullptr), LOGPIXELSX);
-        RECT rc = {0, 0, app.S(820), app.S(548)};
+        RECT rc = {0, 0, app.S(820), app.S(572)};
         AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
         HWND h = CreateWindowW(L"RemoteDisplayApp", L"RemoteDisplay",
                                WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN,
@@ -119,6 +119,7 @@ private:
         cfg_ = std::make_unique<Config>();
         hostCfg_.psk = cfg_->HostKey();
         hostCfg_.requireApproval = cfg_->RequireApproval();
+        hostCfg_.allowControl = cfg_->AllowControl();
 
         // ---- left card: share this PC
         Add(L"STATIC", L"THIS PC", SS_LEFT, 44, 108, 200, 16, IDC_LBL_ADDR + 100);
@@ -130,17 +131,18 @@ private:
         Add(L"EDIT", L"", ES_READONLY | ES_AUTOHSCROLL | WS_TABSTOP, 44, 244, 252, 28, IDC_KEY, WS_EX_CLIENTEDGE);
         Add(L"BUTTON", L"Copy", BS_PUSHBUTTON | WS_TABSTOP, 304, 244, 60, 28, IDC_COPY_KEY);
         Add(L"BUTTON", L"Generate a new key", BS_PUSHBUTTON | WS_TABSTOP, 44, 278, 150, 24, IDC_NEW_KEY);
-        Add(L"BUTTON", L"Ask me before allowing a connection", BS_AUTOCHECKBOX | WS_TABSTOP, 44, 308, 320, 24, IDC_APPROVE);
-        Add(L"BUTTON", L"Start sharing", BS_OWNERDRAW | WS_TABSTOP, 44, 340, 320, 40, IDC_SHARE);
-        Add(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS, 44, 390, 226, 20, IDC_STATUS);
-        Add(L"BUTTON", L"Disconnect", BS_PUSHBUTTON | WS_TABSTOP, 276, 388, 88, 24, IDC_DISCONNECT);
+        Add(L"BUTTON", L"Ask me before allowing a connection", BS_AUTOCHECKBOX | WS_TABSTOP, 44, 306, 320, 24, IDC_APPROVE);
+        Add(L"BUTTON", L"Allow mouse and keyboard control", BS_AUTOCHECKBOX | WS_TABSTOP, 44, 332, 320, 24, IDC_CONTROL);
+        Add(L"BUTTON", L"Start sharing", BS_OWNERDRAW | WS_TABSTOP, 44, 364, 320, 40, IDC_SHARE);
+        Add(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS, 44, 414, 226, 20, IDC_STATUS);
+        Add(L"BUTTON", L"Disconnect", BS_PUSHBUTTON | WS_TABSTOP, 276, 412, 88, 24, IDC_DISCONNECT);
 
         // ---- background service (bottom of the left card)
-        Add(L"STATIC", L"BACKGROUND SERVICE", SS_LEFT, 44, 428, 200, 16, IDC_SVC_TITLE);
-        Add(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS, 44, 450, 190, 22, IDC_SVC_STATUS);
-        Add(L"BUTTON", L"Install", BS_PUSHBUTTON | WS_TABSTOP, 244, 446, 120, 28, IDC_SVC_BTN);
+        Add(L"STATIC", L"BACKGROUND SERVICE", SS_LEFT, 44, 452, 200, 16, IDC_SVC_TITLE);
+        Add(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS, 44, 474, 190, 22, IDC_SVC_STATUS);
+        Add(L"BUTTON", L"Install", BS_PUSHBUTTON | WS_TABSTOP, 244, 470, 120, 28, IDC_SVC_BTN);
         Add(L"STATIC", L"Starts with Windows - stays shareable after a reboot.",
-            SS_LEFT, 44, 478, 320, 18, IDC_SVC_HINT);
+            SS_LEFT, 44, 502, 320, 18, IDC_SVC_HINT);
 
         // ---- right card: connect
         Add(L"STATIC", L"REMOTE PC", SS_LEFT, 436, 108, 200, 16, IDC_LBL_RADDR + 100);
@@ -149,10 +151,9 @@ private:
         Add(L"COMBOBOX", L"", CBS_DROPDOWN | CBS_AUTOHSCROLL | WS_VSCROLL | WS_TABSTOP, 436, 186, 340, 220, IDC_REMOTE);
         Add(L"STATIC", L"Pairing key", SS_LEFT, 436, 224, 200, 18, IDC_LBL_RKEY);
         Add(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, 436, 244, 340, 28, IDC_REMOTE_KEY, WS_EX_CLIENTEDGE);
-        Add(L"STATIC", L"Enter the address and pairing key shown in RemoteDisplay on the other PC. "
-                       L"This version is view-only.", SS_LEFT, 436, 282, 340, 44, IDC_HINT);
-        Add(L"BUTTON", L"Connect", BS_OWNERDRAW | WS_TABSTOP, 436, 340, 340, 40, IDC_CONNECT);
-        Add(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS, 436, 390, 340, 20, IDC_MSG);
+        Add(L"STATIC", L"Enter the address and pairing key shown in the other PC's RemoteDisplay window.", SS_LEFT, 436, 282, 340, 44, IDC_HINT);
+        Add(L"BUTTON", L"Connect", BS_OWNERDRAW | WS_TABSTOP, 436, 364, 340, 40, IDC_CONNECT);
+        Add(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS, 436, 414, 340, 20, IDC_MSG);
 
         for (const auto& ip : LocalIPv4()) SendMessageW(Ctrl(IDC_IPS), CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(W(ip).c_str()));
         if (SendMessage(Ctrl(IDC_IPS), CB_GETCOUNT, 0, 0) == 0)
@@ -160,6 +161,7 @@ private:
         SendMessage(Ctrl(IDC_IPS), CB_SETCURSEL, 0, 0);
         SetText(IDC_KEY, W(rd::FormatKey(hostCfg_.psk.data())));
         CheckDlgButton(hwnd_, IDC_APPROVE, hostCfg_.requireApproval ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hwnd_, IDC_CONTROL, hostCfg_.allowControl ? BST_CHECKED : BST_UNCHECKED);
         ShowWindow(Ctrl(IDC_DISCONNECT), SW_HIDE);
 
         recents_ = cfg_->Recents();
@@ -183,6 +185,7 @@ private:
         float fps = 0;
         std::string peer, error;
         bool viaService = false;
+        bool controlling = false;
         uint32_t workerPid = 0;
     };
 
@@ -198,6 +201,7 @@ private:
                 v.fps = s.fps;
                 v.peer = s.peer;
                 v.error = s.error;
+                v.controlling = s.controlling != 0;
                 v.workerPid = s.pid;
             } else {
                 v.state = rdh::HostStatus::Starting;  // service is up, its worker is still starting
@@ -208,6 +212,7 @@ private:
         v.fps = host_.fps;
         v.peer = host_.Peer();
         v.error = host_.Error();
+        v.controlling = host_.controlling;
         return v;
     }
 
@@ -268,6 +273,7 @@ private:
                 return;
             }
             hostCfg_.requireApproval = IsDlgButtonChecked(hwnd_, IDC_APPROVE) == BST_CHECKED;
+            hostCfg_.allowControl = IsDlgButtonChecked(hwnd_, IDC_CONTROL) == BST_CHECKED;
             host_.state = rdh::HostStatus::Starting;
             host_.approve = host_.deny = host_.kick = false;
             promptShown_ = false;
@@ -293,7 +299,7 @@ private:
                 std::string peer = v.peer;
                 peer = peer.substr(0, peer.rfind(':'));  // IP only, the port is noise here
                 wchar_t b[160];
-                swprintf_s(b, L"● %s viewing - %.0f fps", W(peer).c_str(), v.fps);
+                swprintf_s(b, v.controlling ? L"● %s controlling - %.0f fps" : L"● %s viewing - %.0f fps", W(peer).c_str(), v.fps);
                 status = b; c = kGreen; break;
             }
             case rdh::HostStatus::Failed: status = W(v.error); c = kRed; break;
@@ -341,7 +347,9 @@ private:
         promptShown_ = true;
         if (IsIconic(hwnd_)) ShowWindow(hwnd_, SW_RESTORE);
         SetForegroundWindow(hwnd_);
-        std::wstring msg = W(host_.Peer()) + L" has your pairing key and wants to view your screen.\n\nAllow this connection?";
+        std::wstring msg = W(host_.Peer()) + (hostCfg_.allowControl ? L" has your pairing key and wants to view and control your screen."
+                                                              : L" has your pairing key and wants to view your screen.") +
+                           L"\n\nAllow this connection?";
         int r = MessageBoxW(hwnd_, msg.c_str(), L"RemoteDisplay - connection request",
                             MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2 | MB_SETFOREGROUND | MB_TOPMOST);
         if (host_.state == rdh::HostStatus::AwaitingApproval) {  // client may have left meanwhile
@@ -411,14 +419,14 @@ private:
         HBRUSH card = CreateSolidBrush(kCard);
         SelectObject(mem, pen);
         SelectObject(mem, card);
-        RoundRect(mem, S(24), S(96), S(404), S(508), S(14), S(14));
-        RoundRect(mem, S(416), S(96), S(796), S(508), S(14), S(14));
+        RoundRect(mem, S(24), S(96), S(404), S(532), S(14), S(14));
+        RoundRect(mem, S(416), S(96), S(796), S(532), S(14), S(14));
         DeleteObject(pen);
         DeleteObject(card);
 
         SetTextColor(mem, kMuted);
         SelectObject(mem, fontSmall_);
-        TextOutW(mem, S(26), S(520), L"AES-128-GCM encrypted. Connections need your pairing key.", 56);
+        TextOutW(mem, S(26), S(544), L"AES-128-GCM encrypted. Connections need your pairing key.", 56);
 
         BitBlt(dc, 0, 0, cr.right, cr.bottom, mem, 0, 0, SRCCOPY);
         SelectObject(mem, old);
@@ -544,6 +552,11 @@ private:
                         break;
                     case IDC_APPROVE:
                         cfg_->SetRequireApproval(IsDlgButtonChecked(h, IDC_APPROVE) == BST_CHECKED);
+                        ApplyToService();
+                        break;
+                    case IDC_CONTROL:
+                        cfg_->SetAllowControl(IsDlgButtonChecked(h, IDC_CONTROL) == BST_CHECKED);
+                        hostCfg_.allowControl = IsDlgButtonChecked(h, IDC_CONTROL) == BST_CHECKED;  // live for this window's host
                         ApplyToService();
                         break;
                     case IDC_REMOTE:

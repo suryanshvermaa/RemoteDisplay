@@ -4,6 +4,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <windowsx.h>
 #include <mmsystem.h>
 #include <d3d11.h>
 #include <d3d11_1.h>
@@ -18,11 +19,14 @@
 
 #include <array>
 #include <atomic>
+#include <algorithm>
 #include <chrono>
+#include <deque>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -34,7 +38,7 @@ namespace rdv {
 
 using Microsoft::WRL::ComPtr;
 
-constexpr UINT kMsgTitle = WM_APP + 1;
+constexpr UINT kMsgTitle = WM_APP + 1, kMsgCursor = WM_APP + 2;
 
 inline uint64_t NowUs() {
     return std::chrono::duration_cast<std::chrono::microseconds>(
@@ -67,8 +71,103 @@ public:
     std::atomic<UINT> winW{1280}, winH{720};
     std::thread worker;
 
+    // Remote control: the UI thread produces events, the network thread sends them reliably.
+    std::atomic<bool> controlAllowed{false};  // host says the user allows mouse/keyboard control
+    std::atomic<UINT> videoW{0}, videoH{0};   // size of the picture being shown (for pointer mapping)
+    std::atomic<bool> moveDirty{false};
+    std::atomic<uint32_t> movePos{0};         // newest pointer position: x | y << 16 (normalised)
+    std::mutex inMu;
+    std::deque<rd::InputEvent> inQueue;       // reliable events not yet handed to the network thread
+
 private:
     static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l);
+    static LRESULT CALLBACK LlKeyboardProc(int code, WPARAM w, LPARAM l);
+
+    // Window pixel -> 0..65535 across the picture (letterbox bars clamp to the nearest edge).
+    bool MapPoint(int px, int py, uint16_t& nx, uint16_t& ny) const {
+        const double vw = videoW, vh = videoH, ww = winW, wh = winH;
+        if (vw < 1 || vh < 1 || ww < 1 || wh < 1) return false;
+        const double k = std::min(ww / vw, wh / vh);
+        const double dw = vw * k, dh = vh * k, left = (ww - dw) / 2, top = (wh - dh) / 2;
+        const double fx = std::clamp((px - left) / dw, 0.0, 1.0), fy = std::clamp((py - top) / dh, 0.0, 1.0);
+        nx = uint16_t(fx * 65535 + 0.5);
+        ny = uint16_t(fy * 65535 + 0.5);
+        return true;
+    }
+
+    void Push(const rd::InputEvent& e) {
+        if (!controlAllowed) return;
+        std::lock_guard<std::mutex> l(inMu);
+        if (inQueue.size() < 512) inQueue.push_back(e);
+    }
+
+    void OnMouseMove(LPARAM l) {
+        uint16_t nx, ny;
+        if (!controlAllowed || !MapPoint(GET_X_LPARAM(l), GET_Y_LPARAM(l), nx, ny)) return;
+        lastNx_ = nx;
+        lastNy_ = ny;
+        movePos = uint32_t(nx) | (uint32_t(ny) << 16);
+        moveDirty = true;
+    }
+
+    void OnButton(int idx, bool down, LPARAM l) {
+        uint16_t nx, ny;
+        if (!controlAllowed || !MapPoint(GET_X_LPARAM(l), GET_Y_LPARAM(l), nx, ny)) return;
+        lastNx_ = nx;
+        lastNy_ = ny;
+        if (down) SetCapture(hwnd);  // keep getting moves/up while dragging outside the window
+        btnDown_[idx] = down;
+        if (!down && !btnDown_[0] && !btnDown_[1] && !btnDown_[2] && !btnDown_[3] && !btnDown_[4]) ReleaseCapture();
+        Push({uint8_t(rd::InputType::Button), uint8_t(idx | (down ? 0x80 : 0)), nx, ny, 0});
+    }
+
+    void OnWheel(int delta, bool horizontal, LPARAM l) {
+        POINT pt = {GET_X_LPARAM(l), GET_Y_LPARAM(l)};  // wheel messages carry screen coordinates
+        ScreenToClient(hwnd, &pt);
+        uint16_t nx, ny;
+        if (!controlAllowed || !MapPoint(pt.x, pt.y, nx, ny)) return;
+        Push({uint8_t(rd::InputType::Wheel), uint8_t(horizontal ? 1 : 0), nx, ny, int16_t(delta)});
+    }
+
+    void ForwardKey(UINT scan, bool extended, UINT vk, bool down) {
+        if (scan == 0 || !controlAllowed) return;
+        const uint32_t id = scan | (extended ? 1u << 16 : 0);
+        if (down) keysDown_.insert(id); else keysDown_.erase(id);
+        Push({uint8_t(rd::InputType::Key), uint8_t((down ? 0 : 1) | (extended ? 2 : 0)), uint16_t(scan), uint16_t(vk), 0});
+    }
+
+    // Focus lost or window closing: never leave keys or buttons held down on the remote PC.
+    void ReleaseHeld() {
+        for (uint32_t id : std::set<uint32_t>(keysDown_))
+            ForwardKey(id & 0xFFFF, (id >> 16) & 1, 0, false);
+        keysDown_.clear();
+        for (int b = 0; b < 5; ++b) {
+            if (!btnDown_[b]) continue;
+            btnDown_[b] = false;
+            Push({uint8_t(rd::InputType::Button), uint8_t(b), lastNx_, lastNy_, 0});  // release where it was pressed last
+        }
+        if (GetCapture() == hwnd) ReleaseCapture();
+    }
+
+    void InstallHook() {
+        if (g_hook_) return;
+        g_hookOwner_ = this;
+        g_hook_ = SetWindowsHookExW(WH_KEYBOARD_LL, LlKeyboardProc, GetModuleHandleW(nullptr), 0);
+    }
+    void RemoveHook() {
+        if (g_hook_ && g_hookOwner_ == this) {
+            UnhookWindowsHookEx(g_hook_);
+            g_hook_ = nullptr;
+            g_hookOwner_ = nullptr;
+        }
+    }
+
+    HCURSOR cursor_ = nullptr;
+    std::set<uint32_t> keysDown_;
+    bool btnDown_[5] = {};
+    uint16_t lastNx_ = 0, lastNy_ = 0;
+    static inline HHOOK g_hook_ = nullptr;
+    static inline Viewer* g_hookOwner_ = nullptr;
 
     void ToggleFullscreen() {
         if (!fullscreen_) {
@@ -339,6 +438,38 @@ private:
 };
 
 // ---------------------------------------------------------------------------------------------
+// Builds a Windows cursor from the host's shape blob (CursorBlobHeader + BGRA pixels).
+inline HCURSOR MakeCursor(const uint8_t* blob, size_t n) {
+    if (n < sizeof(rd::CursorBlobHeader)) return nullptr;
+    rd::CursorBlobHeader ch;
+    memcpy(&ch, blob, sizeof(ch));
+    if (ch.w == 0 || ch.h == 0 || ch.w > 256 || ch.h > 256 || n < sizeof(ch) + size_t(ch.w) * ch.h * 4) return nullptr;
+    BITMAPV5HEADER bi = {};
+    bi.bV5Size = sizeof(bi);
+    bi.bV5Width = ch.w;
+    bi.bV5Height = -LONG(ch.h);  // top-down
+    bi.bV5Planes = 1;
+    bi.bV5BitCount = 32;
+    bi.bV5Compression = BI_BITFIELDS;
+    bi.bV5RedMask = 0x00FF0000;
+    bi.bV5GreenMask = 0x0000FF00;
+    bi.bV5BlueMask = 0x000000FF;
+    bi.bV5AlphaMask = 0xFF000000;
+    void* bits = nullptr;
+    HBITMAP color = CreateDIBSection(nullptr, reinterpret_cast<BITMAPINFO*>(&bi), DIB_RGB_COLORS, &bits, nullptr, 0);
+    HBITMAP mask = CreateBitmap(ch.w, ch.h, 1, 1, nullptr);
+    HCURSOR cur = nullptr;
+    if (color && mask && bits) {
+        memcpy(bits, blob + sizeof(ch), size_t(ch.w) * ch.h * 4);
+        ICONINFO ii = {FALSE, DWORD(std::clamp<int>(ch.hotX, 0, ch.w - 1)), DWORD(std::clamp<int>(ch.hotY, 0, ch.h - 1)), mask, color};
+        cur = reinterpret_cast<HCURSOR>(CreateIconIndirect(&ii));
+    }
+    if (color) DeleteObject(color);
+    if (mask) DeleteObject(mask);
+    return cur;
+}
+
+// ---------------------------------------------------------------------------------------------
 inline void Worker(Viewer* v, std::string hostIp, int port, std::array<uint8_t, rd::kKeyLen> psk) {
     const std::string base = "RemoteDisplay - " + hostIp;
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -354,7 +485,7 @@ inline void Worker(Viewer* v, std::string hostIp, int port, std::array<uint8_t, 
     SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     int rb = 8 << 20;
     setsockopt(sock, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<char*>(&rb), sizeof(rb));
-    DWORD to = 4;  // ms; lets us send keepalives while idle
+    DWORD to = 2;  // ms; lets us send keepalives and input while idle
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<char*>(&to), sizeof(to));
     sockaddr_in host = {};
     host.sin_family = AF_INET;
@@ -375,6 +506,17 @@ inline void Worker(Viewer* v, std::string hostIp, int port, std::array<uint8_t, 
     uint64_t lastHello = 0, lastKeyReq = 0;
     uint64_t statStart = NowUs(), statFrames = 0, statBytes = 0, decUsSum = 0;
 
+    // Remote control: events get consecutive sequence numbers and are resent until the host acks.
+    uint32_t inAcked = 0;                 // everything below this was applied by the host
+    std::deque<rd::InputEvent> unacked;   // seq = inAcked + index
+    uint64_t lastInputSend = 0, lastMoveSend = 0;
+    bool inputFresh = false;
+    // Cursor shape reassembly.
+    uint32_t cId = 0;
+    uint16_t cCount = 0, cGot = 0;
+    std::vector<uint8_t> cBuf;
+    std::vector<bool> cSeen;
+
     // Secure session state: handshake until the host proves it knows the pairing key.
     rd::Session sess;
     std::unique_ptr<rd::ClientHandshake> hs;
@@ -391,6 +533,56 @@ inline void Worker(Viewer* v, std::string hostIp, int port, std::array<uint8_t, 
         size_t wn = sess.Seal(reinterpret_cast<uint8_t*>(&ch), sizeof(ch), wire);
         if (wn) sendto(sock, reinterpret_cast<char*>(wire), int(wn), 0,
                        reinterpret_cast<sockaddr*>(&host), sizeof(host));
+    };
+    auto sendInner = [&](rd::PacketType t, uint32_t frameId, const void* body, size_t n) {
+        uint8_t plain[sizeof(rd::PacketHeader) + 256], wire[sizeof(plain) + sizeof(rd::WireHeader) + rd::kTagLen];
+        rd::PacketHeader ph = {};
+        ph.magic = rd::kMagic;
+        ph.type = uint8_t(t);
+        ph.frameId = frameId;
+        ph.payloadLen = uint16_t(n);
+        memcpy(plain, &ph, sizeof(ph));
+        if (n) memcpy(plain + sizeof(ph), body, n);
+        size_t wn = sess.Seal(plain, sizeof(ph) + n, wire);
+        if (wn) sendto(sock, reinterpret_cast<char*>(wire), int(wn), 0, reinterpret_cast<sockaddr*>(&host), sizeof(host));
+    };
+    auto resetInput = [&]() {
+        inAcked = 0;
+        unacked.clear();
+        inputFresh = false;
+        v->controlAllowed = false;
+        v->moveDirty = false;
+        std::lock_guard<std::mutex> l(v->inMu);
+        v->inQueue.clear();
+    };
+    auto pumpInput = [&]() {
+        if (!connected || !v->controlAllowed) return;
+        {
+            std::lock_guard<std::mutex> l(v->inMu);
+            while (!v->inQueue.empty()) {
+                unacked.push_back(v->inQueue.front());
+                v->inQueue.pop_front();
+                inputFresh = true;
+            }
+        }
+        if (v->moveDirty && NowUs() - lastMoveSend > 3'000) {  // throttled; stays dirty until sent
+            v->moveDirty = false;
+            const uint32_t pos = v->movePos;
+            rd::MoveBody mb = {uint16_t(pos & 0xFFFF), uint16_t(pos >> 16)};
+            sendInner(rd::PacketType::InputMove, 0, &mb, sizeof(mb));
+            lastMoveSend = NowUs();
+        }
+        // Send new events at once; otherwise resend the unacked window every 30 ms until acked.
+        if (!unacked.empty() && (inputFresh || NowUs() - lastInputSend > 30'000)) {
+            uint8_t body[sizeof(rd::InputBody) + rd::kMaxInputEventsPerPacket * sizeof(rd::InputEvent)];
+            const size_t cnt = std::min(unacked.size(), rd::kMaxInputEventsPerPacket);
+            rd::InputBody ib = {inAcked, uint8_t(cnt)};
+            memcpy(body, &ib, sizeof(ib));
+            for (size_t i = 0; i < cnt; ++i) memcpy(body + sizeof(ib) + i * sizeof(rd::InputEvent), &unacked[i], sizeof(rd::InputEvent));
+            sendInner(rd::PacketType::Input, 0, body, sizeof(ib) + cnt * sizeof(rd::InputEvent));
+            lastInputSend = NowUs();
+            inputFresh = unacked.size() > cnt;  // more waiting behind this packet
+        }
     };
     auto requestKey = [&]() {
         needKey = true;
@@ -409,6 +601,7 @@ inline void Worker(Viewer* v, std::string hostIp, int port, std::array<uint8_t, 
             hs.reset();
             haveCur = false;
             needKey = true;
+            resetInput();
             v->SetTitle(base + "  -  reconnecting...");
         }
         if (!connected && NowUs() - lastHs > 300'000) {
@@ -426,6 +619,7 @@ inline void Worker(Viewer* v, std::string hostIp, int port, std::array<uint8_t, 
             sendCtrl(rd::PacketType::Hello);
             lastHello = NowUs();
         }
+        pumpInput();
 
         int wn = recv(sock, reinterpret_cast<char*>(wirebuf), int(sizeof(wirebuf)), 0);
         if (wn < int(sizeof(rd::WireHeader))) continue;
@@ -440,7 +634,8 @@ inline void Worker(Viewer* v, std::string hostIp, int port, std::array<uint8_t, 
                 sendCtrl(rd::PacketType::Hello);  // first authenticated packet activates the host session
                 lastHello = NowUs();
                 needKey = true;
-                v->SetTitle(base + "  -  connected (view only)");
+                resetInput();
+                v->SetTitle(base + "  -  connected");
             }
             continue;
         }
@@ -452,7 +647,47 @@ inline void Worker(Viewer* v, std::string hostIp, int port, std::array<uint8_t, 
         if (n < int(sizeof(rd::PacketHeader))) continue;
         rd::PacketHeader h;
         memcpy(&h, pkt.data(), sizeof(h));
-        if (h.magic != rd::kMagic || h.type != uint8_t(rd::PacketType::Video)) continue;
+        if (h.magic != rd::kMagic) continue;
+        if (h.type == uint8_t(rd::PacketType::Hello)) {  // host keepalive, carries what the user allows
+            const bool allowed = (h.flags & rd::kFlagControlAllowed) != 0;
+            if (allowed != v->controlAllowed) {
+                v->controlAllowed = allowed;
+                v->SetTitle(base + (allowed ? "  -  connected, remote control on" : "  -  connected, view only"));
+            }
+            continue;
+        }
+        if (h.type == uint8_t(rd::PacketType::InputAck)) {
+            while (int32_t(h.frameId - inAcked) > 0 && !unacked.empty()) {
+                unacked.pop_front();
+                ++inAcked;
+            }
+            continue;
+        }
+        if (h.type == uint8_t(rd::PacketType::Cursor)) {
+            if (h.fragCount == 0 || h.fragIdx >= h.fragCount || h.payloadLen > rd::kMaxPayload ||
+                n < int(sizeof(h) + h.payloadLen))
+                continue;
+            if (h.frameId != cId || h.fragCount != cCount) {  // a different shape: start over
+                cId = h.frameId;
+                cCount = h.fragCount;
+                cGot = 0;
+                cBuf.assign(size_t(cCount) * rd::kMaxPayload, 0);
+                cSeen.assign(cCount, false);
+            }
+            if (cSeen[h.fragIdx]) continue;
+            memcpy(&cBuf[size_t(h.fragIdx) * rd::kMaxPayload], pkt.data() + sizeof(h), h.payloadLen);
+            cSeen[h.fragIdx] = true;
+            if (h.fragIdx + 1 == cCount) cBuf.resize(size_t(h.fragIdx) * rd::kMaxPayload + h.payloadLen);
+            if (++cGot == cCount) {
+                cGot = 0;  // later repeats of the same shape rebuild it, which is harmless
+                std::fill(cSeen.begin(), cSeen.end(), false);
+                if (HCURSOR cur = MakeCursor(cBuf.data(), cBuf.size()); cur && v->hwnd)
+                    PostMessage(v->hwnd, kMsgCursor, 0, reinterpret_cast<LPARAM>(cur));
+                cBuf.resize(size_t(cCount) * rd::kMaxPayload);
+            }
+            continue;
+        }
+        if (h.type != uint8_t(rd::PacketType::Video)) continue;
         if (h.fragCount == 0 || h.fragIdx >= h.fragCount || h.payloadLen > rd::kMaxPayload ||
             n < int(sizeof(h) + h.payloadLen))
             continue;
@@ -489,6 +724,8 @@ inline void Worker(Viewer* v, std::string hostIp, int port, std::array<uint8_t, 
         lastDecoded = curId;
         haveDecoded = true;
         if (ok && tex) {
+            v->videoW = dec.width();
+            v->videoH = dec.height();
             r.Present(tex, slice, dec.width(), dec.height());
             ++statFrames;
         }
@@ -497,8 +734,8 @@ inline void Worker(Viewer* v, std::string hostIp, int port, std::array<uint8_t, 
         if (NowUs() - statStart >= 1'000'000) {
             double sec = (NowUs() - statStart) / 1e6;
             char title[160];
-            snprintf(title, sizeof(title), "  -  %.0f fps  %.1f Mbps  decode %.1f ms",
-                     statFrames / sec, statBytes * 8 / sec / 1e6,
+            snprintf(title, sizeof(title), "  -  %s  -  %.0f fps  %.1f Mbps  decode %.1f ms",
+                     v->controlAllowed ? "controlling" : "view only", statFrames / sec, statBytes * 8 / sec / 1e6,
                      statFrames ? decUsSum / 1000.0 / statFrames : 0.0);
             v->SetTitle(base + title);
             statStart = NowUs();
@@ -530,11 +767,71 @@ inline LRESULT CALLBACK Viewer::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 return 0;
             }
             case WM_KEYDOWN:
-                if (w == VK_F11 || (w == VK_ESCAPE && v->fullscreen_)) v->ToggleFullscreen();
+            case WM_SYSKEYDOWN:
+            case WM_KEYUP:
+            case WM_SYSKEYUP: {
+                const bool down = (m == WM_KEYDOWN || m == WM_SYSKEYDOWN);
+                if (w == VK_F11) {  // local shortcut: fullscreen (never forwarded)
+                    if (down && !(l & (1 << 30))) v->ToggleFullscreen();
+                } else if (w == VK_ESCAPE && v->fullscreen_ && !v->controlAllowed) {
+                    if (down) v->ToggleFullscreen();
+                } else {
+                    v->ForwardKey((l >> 16) & 0xFF, (l >> 24) & 1, UINT(w), down);
+                }
+                return 0;  // also keeps Alt/F10 from opening the window menu
+            }
+            case WM_CHAR:
+            case WM_SYSCHAR:
+            case WM_DEADCHAR:
+                return 0;  // the host turns scancodes into characters itself
+            case WM_MOUSEMOVE: v->OnMouseMove(l); return 0;
+            case WM_LBUTTONDOWN: v->OnButton(0, true, l); return 0;
+            case WM_LBUTTONUP: v->OnButton(0, false, l); return 0;
+            case WM_RBUTTONDOWN: v->OnButton(1, true, l); return 0;
+            case WM_RBUTTONUP: v->OnButton(1, false, l); return 0;
+            case WM_MBUTTONDOWN: v->OnButton(2, true, l); return 0;
+            case WM_MBUTTONUP: v->OnButton(2, false, l); return 0;
+            case WM_XBUTTONDOWN:
+            case WM_XBUTTONUP:
+                v->OnButton(GET_XBUTTON_WPARAM(w) == XBUTTON1 ? 3 : 4, m == WM_XBUTTONDOWN, l);
+                return TRUE;
+            case WM_MOUSEWHEEL: v->OnWheel(GET_WHEEL_DELTA_WPARAM(w), false, l); return 0;
+            case WM_MOUSEHWHEEL: v->OnWheel(GET_WHEEL_DELTA_WPARAM(w), true, l); return 0;
+            case WM_SETCURSOR:
+                if (LOWORD(l) == HTCLIENT) {
+                    SetCursor(v->cursor_ ? v->cursor_ : LoadCursor(nullptr, IDC_ARROW));
+                    return TRUE;
+                }
+                break;
+            case kMsgCursor: {
+                HCURSOR fresh = reinterpret_cast<HCURSOR>(l), old = v->cursor_;
+                v->cursor_ = fresh;
+                POINT pt;
+                RECT rc;
+                GetCursorPos(&pt);
+                GetClientRect(h, &rc);
+                ScreenToClient(h, &pt);
+                if (PtInRect(&rc, pt)) SetCursor(fresh);
+                if (old) DestroyCursor(old);
+                return 0;
+            }
+            case WM_ACTIVATE:
+                if (LOWORD(w) == WA_INACTIVE) {
+                    v->ReleaseHeld();
+                    v->RemoveHook();
+                } else {
+                    v->InstallHook();
+                }
+                return 0;
+            case WM_KILLFOCUS:
+                v->ReleaseHeld();
                 return 0;
             case WM_ERASEBKGND:
                 return 1;
             case WM_DESTROY:
+                v->ReleaseHeld();
+                v->RemoveHook();
+                if (v->cursor_) { DestroyCursor(v->cursor_); v->cursor_ = nullptr; }
                 SetWindowLongPtr(h, GWLP_USERDATA, 0);
                 v->run = false;
                 v->hwnd = nullptr;
@@ -544,6 +841,27 @@ inline LRESULT CALLBACK Viewer::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
     }
     return DefWindowProc(h, m, w, l);
+}
+
+// Win key, Alt+Tab, Alt+Esc, Ctrl+Esc and the Menu key are normally eaten by Windows before the
+// window sees them. While the viewer is focused and control is on, they go to the remote PC instead.
+inline LRESULT CALLBACK Viewer::LlKeyboardProc(int code, WPARAM w, LPARAM l) {
+    if (code == HC_ACTION) {
+        const auto* k = reinterpret_cast<const KBDLLHOOKSTRUCT*>(l);
+        Viewer* v = g_hookOwner_;
+        if (v && v->hwnd && v->controlAllowed && !(k->flags & LLKHF_INJECTED) && GetForegroundWindow() == v->hwnd) {
+            const bool alt = (k->flags & LLKHF_ALTDOWN) != 0;
+            const bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+            const bool grab = k->vkCode == VK_LWIN || k->vkCode == VK_RWIN || k->vkCode == VK_APPS ||
+                              (k->vkCode == VK_TAB && alt) || (k->vkCode == VK_ESCAPE && (alt || ctrl));
+            if (grab) {
+                const bool down = (w == WM_KEYDOWN || w == WM_SYSKEYDOWN);
+                v->ForwardKey(k->scanCode, (k->flags & LLKHF_EXTENDED) != 0, k->vkCode, down);
+                return 1;  // swallow: do not let the local Start menu / task switcher react
+            }
+        }
+    }
+    return CallNextHookEx(nullptr, code, w, l);
 }
 
 inline Viewer* Viewer::Create(HINSTANCE inst, HWND owner, UINT closedMsg, const std::string& host, int port,
