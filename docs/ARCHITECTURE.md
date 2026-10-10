@@ -20,8 +20,8 @@ Latency design choices:
 ## Run
 
 ```
-build\Released-host.exe                      # prints a pairing key
-build\Released-client.exe --key <that key>
+build\Release\rd-host.exe                      # prints a pairing key
+build\Release\rd-client.exe --key <that key>
 ```
 LAN or internet: `rd-host --listen 0.0.0.0` and `rd-client --host <host-ip> --key <key>`.
 The host binds loopback by default. Every datagram is authenticated and encrypted (see
