@@ -104,6 +104,8 @@ public:
     void SetHostKey(const std::array<uint8_t, rd::kKeyLen>& k) { Set(L"host", L"key", Protect(k.data(), k.size())); }
     bool RequireApproval() const { return Get(L"host", L"approve") != "0"; }
     bool AllowControl() const { return Get(L"host", L"control") != "0"; }
+    bool ShowTray() const { return Get(L"app", L"tray") != "0"; }  // default: show the tray icon
+    void SetShowTray(bool v) const { Set(L"app", L"tray", v ? "1" : "0"); }
     void SetAllowControl(bool v) const { Set(L"host", L"control", v ? "1" : "0"); }
     void SetRequireApproval(bool v) const { Set(L"host", L"approve", v ? "1" : "0"); }
 

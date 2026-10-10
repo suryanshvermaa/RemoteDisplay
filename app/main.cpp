@@ -37,7 +37,7 @@ enum Ctl {
     IDC_IPS = 100, IDC_COPY_IP, IDC_KEY, IDC_COPY_KEY, IDC_NEW_KEY, IDC_APPROVE, IDC_SHARE, IDC_STATUS,
     IDC_DISCONNECT, IDC_REMOTE, IDC_REMOTE_KEY, IDC_CONNECT, IDC_MSG, IDC_HINT,
     IDC_LBL_ADDR, IDC_LBL_KEY, IDC_LBL_RADDR, IDC_LBL_RKEY, IDC_TITLE_L, IDC_TITLE_R,
-    IDC_SVC_TITLE, IDC_SVC_STATUS, IDC_SVC_BTN, IDC_SVC_HINT, IDC_CONTROL, IDC_AUTOSTART,
+    IDC_SVC_TITLE, IDC_SVC_STATUS, IDC_SVC_BTN, IDC_SVC_HINT, IDC_CONTROL, IDC_AUTOSTART, IDC_SHOWTRAY,
 };
 enum TrayCmd { IDM_OPEN = 2001, IDM_TOGGLE, IDM_DISCONNECT, IDM_EXIT };
 constexpr UINT kMsgViewerClosed = WM_APP + 10, kMsgSvcDone = WM_APP + 11, kMsgTray = WM_APP + 20,
@@ -197,7 +197,8 @@ private:
 
         // ---- background service (bottom of the left card)
         Add(L"STATIC", L"RUN IN BACKGROUND", SS_LEFT, 44, 444, 200, 16, IDC_SVC_TITLE);
-        Add(L"BUTTON", L"Start with Windows (tray icon, no admin needed)", BS_AUTOCHECKBOX | WS_TABSTOP, 44, 464, 320, 24, IDC_AUTOSTART);
+        Add(L"BUTTON", L"Start with Windows", BS_AUTOCHECKBOX | WS_TABSTOP, 44, 464, 170, 24, IDC_AUTOSTART);
+        Add(L"BUTTON", L"Show tray icon", BS_AUTOCHECKBOX | WS_TABSTOP, 224, 464, 140, 24, IDC_SHOWTRAY);
         Add(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS, 44, 496, 196, 22, IDC_SVC_STATUS);
         Add(L"BUTTON", L"Install", BS_PUSHBUTTON | WS_TABSTOP, 244, 492, 120, 28, IDC_SVC_BTN);
 
@@ -227,6 +228,8 @@ private:
             SendMessage(Ctrl(IDC_REMOTE), CB_SETCURSEL, 0, 0);
             FillRemoteKey(0);
         }
+        showTray_ = cfg_->ShowTray();
+        CheckDlgButton(hwnd_, IDC_SHOWTRAY, showTray_ ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hwnd_, IDC_AUTOSTART, IsStartupEnabled() ? BST_CHECKED : BST_UNCHECKED);
         taskbarCreated_ = RegisterWindowMessageW(L"TaskbarCreated");  // Explorer restarted: re-add the icon
         for (int i = 0; i < 3; ++i) {
@@ -254,6 +257,7 @@ private:
         return nid;
     }
     void AddTray() {
+        if (!showTray_) return;  // user chose to run with no tray icon
         NOTIFYICONDATAW nid = TrayData(NIF_ICON | NIF_MESSAGE | NIF_TIP);
         trayAdded_ = Shell_NotifyIconW(NIM_ADD, &nid) != FALSE;
     }
@@ -667,6 +671,20 @@ private:
                 return 0;
             case WM_CLOSE:
                 // Closing the window while sharing keeps sharing, from the tray (Exit is in its menu).
+                if (!forceExit_ && Sharing() && !showTray_) {
+                    // No tray icon: never keep sharing invisibly by accident, ask first.
+                    const int r = MessageBoxW(h,
+                        L"Keep sharing in the background?\n\nYes: keep running with no icon (launch RemoteDisplay again to open it)\n"
+                        L"No: stop sharing and exit\nCancel: go back to the window",
+                        L"RemoteDisplay", MB_YESNOCANCEL | MB_ICONQUESTION);
+                    if (r == IDCANCEL) return 0;
+                    if (r == IDYES) {
+                        ShowWindow(h, SW_HIDE);
+                        return 0;
+                    }
+                    DestroyWindow(h);  // No: stops sharing and exits
+                    return 0;
+                }
                 if (!forceExit_ && Sharing()) {
                     ShowWindow(h, SW_HIDE);
                     if (!tipShown_) {
@@ -688,6 +706,26 @@ private:
                         forceExit_ = true;
                         DestroyWindow(h);
                         break;
+                    case IDC_SHOWTRAY: {
+                        const bool on = IsDlgButtonChecked(h, IDC_SHOWTRAY) == BST_CHECKED;
+                        if (!on) {
+                            const int r = MessageBoxW(h,
+                                L"Hide the tray icon?\n\nRemoteDisplay will keep running with nothing visible on screen. "
+                                L"To open it again, launch RemoteDisplay from the Start menu or a shortcut. "
+                                L"To stop it, open it and click Stop sharing, or close its window and choose to exit.\n\n"
+                                L"While sharing, you will still be asked before anyone can connect (unless you turned that off).",
+                                L"RemoteDisplay", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
+                            if (r != IDYES) {
+                                CheckDlgButton(h, IDC_SHOWTRAY, BST_CHECKED);
+                                break;
+                            }
+                        }
+                        showTray_ = on;
+                        cfg_->SetShowTray(on);
+                        if (on) AddTray(); else RemoveTray();
+                        Message(on ? L"Tray icon shown." : L"Tray icon hidden. Launch RemoteDisplay again to open it.", kMuted);
+                        break;
+                    }
                     case IDC_AUTOSTART: {
                         const bool on = IsDlgButtonChecked(h, IDC_AUTOSTART) == BST_CHECKED;
                         if (!SetStartupEnabled(on)) {
@@ -780,7 +818,7 @@ private:
     unsigned tick_ = 0;
     HostActiveLock ownLock_;
 
-    bool background_ = false, forceExit_ = false, tipShown_ = false, trayAdded_ = false;
+    bool background_ = false, forceExit_ = false, tipShown_ = false, trayAdded_ = false, showTray_ = true;
     UINT taskbarCreated_ = 0;
     HICON trayIcons_[3] = {};
     int trayState_ = 0;

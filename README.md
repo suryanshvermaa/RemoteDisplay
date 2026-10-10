@@ -42,7 +42,7 @@ There are three ways to run RemoteDisplay on the PC you want to share. Pick one:
 | | Window | Admin needed | Starts | Best for |
 |---|---|---|---|---|
 | **Normal app** | yes | no | when you open it | trying it out |
-| **Start with Windows** (tray) | hidden, tray icon only | no | when you sign in | most people, like Parsec/AnyDesk |
+| **Start with Windows** | hidden; tray icon optional | no | when you sign in | most people, like Parsec/AnyDesk |
 | **Windows service** | none | once, to install | when Windows boots (shares once you are signed in) | always-on PCs |
 
 **Start with Windows (recommended):** tick **Start with Windows** under *Run in background*. It
@@ -52,6 +52,16 @@ sharing, green = sharing, amber = someone connecting or connected). Click the ic
 right-click for *Start/Stop sharing, Disconnect viewer, Exit*. Closing the window while sharing just
 hides it to the tray. Only one copy runs per user: launching it again brings the running one forward.
 Untick the box (or Settings > Apps > Startup) to undo it.
+
+**Fully invisible (no window, no tray icon):** untick **Show tray icon** (it asks you to confirm).
+RemoteDisplay then runs with nothing at all on screen, like a game-streaming host. To get back in,
+launch RemoteDisplay again from the Start menu or a shortcut: it opens the running instance instead
+of starting a second one. To stop it, open it and click **Stop sharing**, or close its window and
+choose *No: stop sharing and exit*. While the icon is hidden, closing the window while sharing always
+asks first, so it never keeps sharing invisibly by accident. The "Allow this connection?" prompt
+still appears when someone connects (unless you turned it off), so with approval on you are never
+connected to without seeing it. With approval off (unattended access) there is no on-screen sign at
+all, so keep the pairing key private.
 
 ### Windows service (optional, needs admin)
 
