@@ -51,7 +51,14 @@ the host serves one client at a time, and new-handshake requests are rate-limite
   single-instance rule and `--background` (hidden, auto-share) mode used by the startup entry. The tray icon is optional (`[app] tray=0` in config.ini); the single-instance relaunch is how a fully hidden instance is reopened.
 - `app/service.h`: install/uninstall (elevated helper), and the service that supervises the worker.
 - `app/worker.h`: `--host-worker`, the headless host in the user session; approval prompt, log.
-- `app/shared.h`: same-user IPC (shared-memory status, kick event, "host active" lock).
+- `app/shared.h`: same-user IPC (shared-memory status, kick/restart events, "host active" lock).
+- `app/ipc_security.h`: elevation helpers: an explicit ACL for shared objects (so a normal-rights window
+  can use an elevated copy's objects), message filters for the shell and second launches, and the
+  machine-wide "elevate the service's worker" flag.
+- `app/admin.h`: administrator mode: elevated Scheduled Task (full XML: no 72 h limit, runs on battery),
+  the HKLM flag, restart-elevated.
+- `service/include/identity.h`: per-device ECDSA identity; `Identify` signs the session's handshake
+  transcript so the host can recognise devices the user chose to trust.
 - `rd-host` / `rd-client`: thin CLI wrappers.
 
 Process model with the service installed:
