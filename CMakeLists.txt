@@ -14,3 +14,9 @@ target_link_libraries(rd-host PRIVATE ${MF_LIBS})
 add_executable(rd-client WIN32 client/src/main.cpp)
 target_include_directories(rd-client PRIVATE service/include)  # shared protocol.h
 target_link_libraries(rd-client PRIVATE ${MF_LIBS} user32)
+
+add_executable(test-session tests/test_session.cpp)
+target_include_directories(test-session PRIVATE service/include)
+target_link_libraries(test-session PRIVATE bcrypt)
+enable_testing()
+add_test(NAME session COMMAND test-session)
