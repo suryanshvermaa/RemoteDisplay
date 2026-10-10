@@ -13,7 +13,10 @@
 #include <thread>
 #include <vector>
 
+#include "common.h"
 #include "host.h"
+#include "service.h"
+#include "shared.h"
 #include "viewer.h"
 
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
@@ -22,182 +25,9 @@
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "gdi32.lib")
 
+using namespace rdapp;
+
 namespace {
-
-// ---------------------------------------------------------------------------------------------
-// helpers
-
-std::wstring W(const std::string& s) {
-    if (s.empty()) return L"";
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), int(s.size()), nullptr, 0);
-    std::wstring w(n, 0);
-    MultiByteToWideChar(CP_UTF8, 0, s.data(), int(s.size()), w.data(), n);
-    return w;
-}
-std::string U(const std::wstring& w) {
-    if (w.empty()) return "";
-    int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), int(w.size()), nullptr, 0, nullptr, nullptr);
-    std::string s(n, 0);
-    WideCharToMultiByte(CP_UTF8, 0, w.data(), int(w.size()), s.data(), n, nullptr, nullptr);
-    return s;
-}
-std::string Trim(std::string s) {
-    while (!s.empty() && isspace(static_cast<unsigned char>(s.back()))) s.pop_back();
-    size_t i = 0;
-    while (i < s.size() && isspace(static_cast<unsigned char>(s[i]))) ++i;
-    return s.substr(i);
-}
-
-// Secrets at rest are protected with the Windows user's DPAPI key (unreadable by other users).
-std::string Protect(const uint8_t* d, size_t n) {
-    DATA_BLOB in{DWORD(n), const_cast<BYTE*>(d)}, out{};
-    if (!CryptProtectData(&in, L"RemoteDisplay", nullptr, nullptr, nullptr, 0, &out)) return "";
-    static const char* hex = "0123456789abcdef";
-    std::string s;
-    for (DWORD i = 0; i < out.cbData; ++i) { s += hex[out.pbData[i] >> 4]; s += hex[out.pbData[i] & 15]; }
-    LocalFree(out.pbData);
-    return s;
-}
-bool Unprotect(const std::string& hexs, std::vector<uint8_t>& result) {
-    if (hexs.empty() || hexs.size() % 2) return false;
-    std::vector<uint8_t> raw;
-    for (size_t i = 0; i < hexs.size(); i += 2) {
-        auto nib = [](char c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1; };
-        int a = nib(hexs[i]), b = nib(hexs[i + 1]);
-        if (a < 0 || b < 0) return false;
-        raw.push_back(uint8_t(a * 16 + b));
-    }
-    DATA_BLOB in{DWORD(raw.size()), raw.data()}, out{};
-    if (!CryptUnprotectData(&in, nullptr, nullptr, nullptr, nullptr, 0, &out)) return false;
-    result.assign(out.pbData, out.pbData + out.cbData);
-    LocalFree(out.pbData);
-    return true;
-}
-
-struct Recent {
-    std::string addr;
-    std::array<uint8_t, rd::kKeyLen> key{};
-};
-
-class Config {
-public:
-    Config() {
-        wchar_t appdata[MAX_PATH] = {};
-        GetEnvironmentVariableW(L"APPDATA", appdata, MAX_PATH);
-        std::wstring dir = std::wstring(appdata) + L"\\RemoteDisplay";
-        CreateDirectoryW(dir.c_str(), nullptr);
-        path_ = dir + L"\\config.ini";
-    }
-
-    std::string Get(const wchar_t* sec, const std::wstring& key) const {
-        wchar_t buf[1024] = {};
-        GetPrivateProfileStringW(sec, key.c_str(), L"", buf, 1024, path_.c_str());
-        return U(buf);
-    }
-    void Set(const wchar_t* sec, const std::wstring& key, const std::string& v) const {
-        WritePrivateProfileStringW(sec, key.c_str(), W(v).c_str(), path_.c_str());
-    }
-
-    std::array<uint8_t, rd::kKeyLen> HostKey() {
-        std::vector<uint8_t> k;
-        std::array<uint8_t, rd::kKeyLen> out{};
-        if (Unprotect(Get(L"host", L"key"), k) && k.size() == rd::kKeyLen) {
-            std::copy(k.begin(), k.end(), out.begin());
-        } else {
-            rd::crypto::Random(out.data(), out.size());
-            SetHostKey(out);
-        }
-        return out;
-    }
-    void SetHostKey(const std::array<uint8_t, rd::kKeyLen>& k) { Set(L"host", L"key", Protect(k.data(), k.size())); }
-    bool RequireApproval() const { return Get(L"host", L"approve") != "0"; }
-    void SetRequireApproval(bool v) const { Set(L"host", L"approve", v ? "1" : "0"); }
-
-    std::vector<Recent> Recents() const {
-        std::vector<Recent> r;
-        int count = atoi(Get(L"recent", L"count").c_str());
-        for (int i = 0; i < count && i < 8; ++i) {
-            Recent x;
-            x.addr = Get(L"recent", L"addr" + std::to_wstring(i));
-            std::vector<uint8_t> k;
-            if (x.addr.empty() || !Unprotect(Get(L"recent", L"key" + std::to_wstring(i)), k) || k.size() != rd::kKeyLen) continue;
-            std::copy(k.begin(), k.end(), x.key.begin());
-            r.push_back(x);
-        }
-        return r;
-    }
-    void AddRecent(const Recent& x) const {
-        std::vector<Recent> r = Recents();
-        r.erase(std::remove_if(r.begin(), r.end(), [&](const Recent& e) { return e.addr == x.addr; }), r.end());
-        r.insert(r.begin(), x);
-        if (r.size() > 8) r.resize(8);
-        Set(L"recent", L"count", std::to_string(r.size()));
-        for (size_t i = 0; i < r.size(); ++i) {
-            Set(L"recent", L"addr" + std::to_wstring(i), r[i].addr);
-            Set(L"recent", L"key" + std::to_wstring(i), Protect(r[i].key.data(), r[i].key.size()));
-        }
-    }
-
-private:
-    std::wstring path_;
-};
-
-std::vector<std::string> LocalIPv4() {
-    std::vector<std::string> out;
-    ULONG len = 0;
-    GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER, nullptr, nullptr, &len);
-    std::vector<uint8_t> buf(len);
-    auto* aa = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data());
-    if (GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER, nullptr, aa, &len) != NO_ERROR)
-        return out;
-    std::vector<std::string> withGw, withoutGw;
-    for (auto* a = aa; a; a = a->Next) {
-        if (a->OperStatus != IfOperStatusUp || a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
-        for (auto* u = a->FirstUnicastAddress; u; u = u->Next) {
-            char ip[INET_ADDRSTRLEN];
-            auto* sa = reinterpret_cast<sockaddr_in*>(u->Address.lpSockaddr);
-            inet_ntop(AF_INET, &sa->sin_addr, ip, sizeof(ip));
-            if (strncmp(ip, "169.254.", 8) == 0) continue;
-            (a->FirstGatewayAddress ? withGw : withoutGw).push_back(ip);
-        }
-    }
-    out = withGw;
-    out.insert(out.end(), withoutGw.begin(), withoutGw.end());
-    return out;
-}
-
-// "host", "host:port" -> resolved IPv4 string + port. Returns false if it cannot be resolved.
-bool ResolveAddress(std::string text, std::string& ip, int& port) {
-    port = rd::kDefaultPort;
-    size_t c = text.rfind(':');
-    if (c != std::string::npos) {
-        port = atoi(text.c_str() + c + 1);
-        text = text.substr(0, c);
-        if (port <= 0 || port > 65535) return false;
-    }
-    addrinfo hints = {}, *res = nullptr;
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_DGRAM;
-    if (getaddrinfo(text.c_str(), nullptr, &hints, &res) != 0 || !res) return false;
-    char buf[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &reinterpret_cast<sockaddr_in*>(res->ai_addr)->sin_addr, buf, sizeof(buf));
-    freeaddrinfo(res);
-    ip = buf;
-    return true;
-}
-
-void CopyToClipboard(HWND h, const std::wstring& text) {
-    if (!OpenClipboard(h)) return;
-    EmptyClipboard();
-    size_t bytes = (text.size() + 1) * sizeof(wchar_t);
-    HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE, bytes);
-    if (g) {
-        memcpy(GlobalLock(g), text.c_str(), bytes);
-        GlobalUnlock(g);
-        SetClipboardData(CF_UNICODETEXT, g);
-    }
-    CloseClipboard();
-}
 
 // ---------------------------------------------------------------------------------------------
 // UI
@@ -206,8 +36,9 @@ enum Ctl {
     IDC_IPS = 100, IDC_COPY_IP, IDC_KEY, IDC_COPY_KEY, IDC_NEW_KEY, IDC_APPROVE, IDC_SHARE, IDC_STATUS,
     IDC_DISCONNECT, IDC_REMOTE, IDC_REMOTE_KEY, IDC_CONNECT, IDC_MSG, IDC_HINT,
     IDC_LBL_ADDR, IDC_LBL_KEY, IDC_LBL_RADDR, IDC_LBL_RKEY, IDC_TITLE_L, IDC_TITLE_R,
+    IDC_SVC_TITLE, IDC_SVC_STATUS, IDC_SVC_BTN, IDC_SVC_HINT,
 };
-constexpr UINT kMsgViewerClosed = WM_APP + 10;
+constexpr UINT kMsgViewerClosed = WM_APP + 10, kMsgSvcDone = WM_APP + 11;
 constexpr UINT_PTR kTimerUi = 1, kTimerCopied = 2;
 
 constexpr COLORREF kBg = RGB(238, 241, 245), kCard = RGB(255, 255, 255), kBorder = RGB(217, 222, 231),
@@ -236,7 +67,7 @@ public:
         App app;
         app.inst_ = inst;
         app.dpi_ = GetDeviceCaps(GetDC(nullptr), LOGPIXELSX);
-        RECT rc = {0, 0, app.S(820), app.S(470)};
+        RECT rc = {0, 0, app.S(820), app.S(548)};
         AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
         HWND h = CreateWindowW(L"RemoteDisplayApp", L"RemoteDisplay",
                                WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN,
@@ -304,6 +135,13 @@ private:
         Add(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS, 44, 390, 226, 20, IDC_STATUS);
         Add(L"BUTTON", L"Disconnect", BS_PUSHBUTTON | WS_TABSTOP, 276, 388, 88, 24, IDC_DISCONNECT);
 
+        // ---- background service (bottom of the left card)
+        Add(L"STATIC", L"BACKGROUND SERVICE", SS_LEFT, 44, 428, 200, 16, IDC_SVC_TITLE);
+        Add(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS, 44, 450, 190, 22, IDC_SVC_STATUS);
+        Add(L"BUTTON", L"Install", BS_PUSHBUTTON | WS_TABSTOP, 244, 446, 120, 28, IDC_SVC_BTN);
+        Add(L"STATIC", L"Starts with Windows - stays shareable after a reboot.",
+            SS_LEFT, 44, 478, 320, 18, IDC_SVC_HINT);
+
         // ---- right card: connect
         Add(L"STATIC", L"REMOTE PC", SS_LEFT, 436, 108, 200, 16, IDC_LBL_RADDR + 100);
         Add(L"STATIC", L"Connect to a computer", SS_LEFT, 436, 126, 340, 28, IDC_TITLE_R);
@@ -339,13 +177,84 @@ private:
     }
 
     // ---- sharing --------------------------------------------------------------------------
+    // What the status area shows: this window's own host, or the background worker's status.
+    struct View {
+        int state = rdh::HostStatus::Stopped;
+        float fps = 0;
+        std::string peer, error;
+        bool viaService = false;
+        uint32_t workerPid = 0;
+    };
+
     bool Sharing() const { return hostThread_.joinable() && host_.state != rdh::HostStatus::Failed; }
+
+    View CurrentView() {
+        View v;
+        if (!Sharing() && svcState_ == SvcState::Running) {
+            v.viaService = true;
+            SharedStatus s;
+            if (StatusReader::Read(s)) {
+                v.state = s.state;
+                v.fps = s.fps;
+                v.peer = s.peer;
+                v.error = s.error;
+                v.workerPid = s.pid;
+            } else {
+                v.state = rdh::HostStatus::Starting;  // service is up, its worker is still starting
+            }
+            return v;
+        }
+        v.state = host_.state;
+        v.fps = host_.fps;
+        v.peer = host_.Peer();
+        v.error = host_.Error();
+        return v;
+    }
 
     void StopSharing() {
         stopHost_ = true;
         if (hostThread_.joinable()) hostThread_.join();
         stopHost_ = false;
         host_.state = rdh::HostStatus::Stopped;
+        ownLock_.Release();
+    }
+
+    // The background worker reads the key and approval setting at start; make it pick up changes.
+    void ApplyToService() {
+        View v = CurrentView();
+        if (v.viaService && v.workerPid) {
+            StatusReader::RestartWorker(v.workerPid);
+            Message(L"Applying to the background service...", kMuted);
+        }
+    }
+
+    void ServiceAction(const wchar_t* verb) {
+        if (svcBusy_) return;
+        if (svcThread_.joinable()) svcThread_.join();
+        if (std::wstring(verb) == L"install" && Sharing()) StopSharing();  // free the port for the service
+        svcBusy_ = true;
+        SetText(IDC_SVC_STATUS, L"Waiting for administrator approval...");
+        EnableWindow(Ctrl(IDC_SVC_BTN), FALSE);
+        svcVerb_ = verb;
+        svcThread_ = std::thread([this, verb] {
+            int rc = RunElevated(hwnd_, std::wstring(L"--service-ctl ") + verb);
+            PostMessage(hwnd_, kMsgSvcDone, WPARAM(rc), 0);
+        });
+    }
+
+    void OnServiceDone(int rc) {
+        if (svcThread_.joinable()) svcThread_.join();
+        svcBusy_ = false;
+        svcState_ = QueryServiceState();
+        if (rc == 0) {
+            Message(svcVerb_ == L"install" ? L"Background service installed and running."
+                                           : L"Background service removed.", kGreen);
+        } else if (rc == -1) {
+            Message(L"Cancelled. Administrator approval is needed for this.");
+        } else {
+            Message(L"Service command failed (code " + std::to_wstring(rc) + L"). See ProgramData\\RemoteDisplay\\service.log");
+        }
+        UpdateUi();
     }
 
     void ToggleSharing() {
@@ -353,6 +262,11 @@ private:
             StopSharing();
         } else {
             StopSharing();  // reap a failed run, if any
+            if (!ownLock_.Acquire()) {
+                Message(L"Another RemoteDisplay host is already running (the background service?).");
+                UpdateUi();
+                return;
+            }
             hostCfg_.requireApproval = IsDlgButtonChecked(hwnd_, IDC_APPROVE) == BST_CHECKED;
             host_.state = rdh::HostStatus::Starting;
             host_.approve = host_.deny = host_.kick = false;
@@ -363,26 +277,31 @@ private:
     }
 
     void UpdateUi() {
-        const int s = host_.state;
+        if (++tick_ % 4 == 1 && !svcBusy_) svcState_ = QueryServiceState();  // about once a second
+        const View v = CurrentView();
+        const int s = v.state;
         const bool sharing = Sharing();
-        bool connected = s == rdh::HostStatus::Streaming;
+        const bool connected = s == rdh::HostStatus::Streaming;
         std::wstring status;
         COLORREF c = kMuted;
         switch (s) {
             case rdh::HostStatus::Starting: status = L"Starting..."; c = kAmber; break;
             case rdh::HostStatus::Waiting: status = L"● Ready - waiting for a connection"; c = kGreen; break;
             case rdh::HostStatus::AwaitingApproval:
-                status = L"● Connection request from " + W(host_.Peer()); c = kAmber; break;
+                status = L"● Connection request from " + W(v.peer); c = kAmber; break;
             case rdh::HostStatus::Streaming: {
-                std::string peer = host_.Peer();
+                std::string peer = v.peer;
                 peer = peer.substr(0, peer.rfind(':'));  // IP only, the port is noise here
                 wchar_t b[160];
-                swprintf_s(b, L"● %s viewing - %.0f fps", W(peer).c_str(), host_.fps.load());
+                swprintf_s(b, L"● %s viewing - %.0f fps", W(peer).c_str(), v.fps);
                 status = b; c = kGreen; break;
             }
-            case rdh::HostStatus::Failed: status = W(host_.Error()); c = kRed; break;
+            case rdh::HostStatus::Failed: status = W(v.error); c = kRed; break;
             default: status = L"Not sharing"; break;
         }
+        if (v.viaService && s != rdh::HostStatus::Failed && s != rdh::HostStatus::Starting && !connected &&
+            s != rdh::HostStatus::AwaitingApproval)
+            status = L"● Sharing in background - waiting for a connection";
         statusColor_ = c;
         if (status != lastStatus_) {
             lastStatus_ = status;
@@ -390,13 +309,34 @@ private:
         }
         InvalidateRect(Ctrl(IDC_STATUS), nullptr, TRUE);
         ShowWindow(Ctrl(IDC_DISCONNECT), connected ? SW_SHOW : SW_HIDE);
-        EnableWindow(Ctrl(IDC_NEW_KEY), !sharing);
-        EnableWindow(Ctrl(IDC_APPROVE), !sharing);
+        EnableWindow(Ctrl(IDC_NEW_KEY), !svcBusy_);
+        EnableWindow(Ctrl(IDC_APPROVE), !sharing || true);
+        EnableWindow(Ctrl(IDC_SHARE), !v.viaService);
         InvalidateRect(Ctrl(IDC_SHARE), nullptr, FALSE);
+
+        // background-service section
+        std::wstring ss, btn;
+        COLORREF sc = kMuted;
+        switch (svcState_) {
+            case SvcState::NotInstalled: ss = L"Not installed"; btn = L"Install"; break;
+            case SvcState::Running: ss = L"● Installed and running"; btn = L"Remove"; sc = kGreen; break;
+            case SvcState::Stopped: ss = L"● Installed, not running"; btn = L"Remove"; sc = kAmber; break;
+            case SvcState::Transition: ss = L"Changing state..."; btn = L"Remove"; sc = kAmber; break;
+        }
+        if (!svcBusy_) {
+            svcColor_ = sc;
+            if (ss != lastSvcStatus_) {
+                lastSvcStatus_ = ss;
+                SetText(IDC_SVC_STATUS, ss);
+                InvalidateRect(Ctrl(IDC_SVC_STATUS), nullptr, TRUE);
+            }
+            SetText(IDC_SVC_BTN, btn);
+            EnableWindow(Ctrl(IDC_SVC_BTN), TRUE);
+        }
     }
 
     void MaybePromptForApproval() {
-        if (host_.state != rdh::HostStatus::AwaitingApproval) { promptShown_ = false; return; }
+        if (!Sharing() || host_.state != rdh::HostStatus::AwaitingApproval) { promptShown_ = false; return; }
         if (promptShown_) return;
         promptShown_ = true;
         if (IsIconic(hwnd_)) ShowWindow(hwnd_, SW_RESTORE);
@@ -471,14 +411,14 @@ private:
         HBRUSH card = CreateSolidBrush(kCard);
         SelectObject(mem, pen);
         SelectObject(mem, card);
-        RoundRect(mem, S(24), S(96), S(404), S(432), S(14), S(14));
-        RoundRect(mem, S(416), S(96), S(796), S(432), S(14), S(14));
+        RoundRect(mem, S(24), S(96), S(404), S(508), S(14), S(14));
+        RoundRect(mem, S(416), S(96), S(796), S(508), S(14), S(14));
         DeleteObject(pen);
         DeleteObject(card);
 
         SetTextColor(mem, kMuted);
         SelectObject(mem, fontSmall_);
-        TextOutW(mem, S(26), S(446), L"AES-128-GCM encrypted. Connections need your pairing key.", 56);
+        TextOutW(mem, S(26), S(520), L"AES-128-GCM encrypted. Connections need your pairing key.", 56);
 
         BitBlt(dc, 0, 0, cr.right, cr.bottom, mem, 0, 0, SRCCOPY);
         SelectObject(mem, old);
@@ -494,6 +434,10 @@ private:
             bool sharing = Sharing();
             label = sharing ? L"Stop sharing" : L"Start sharing";
             fill = sharing ? kRed : kGreen;
+            if (d->itemState & ODS_DISABLED) {
+                label = L"Sharing via background service";
+                fill = RGB(156, 163, 175);
+            }
         } else {
             label = L"Connect";
             fill = kAccent;
@@ -545,6 +489,9 @@ private:
                 SetTextColor(dc, kText);
                 SelectObject(dc, fontNormal_);
                 if (id == IDC_STATUS) SetTextColor(dc, statusColor_);
+                else if (id == IDC_SVC_STATUS) SetTextColor(dc, svcColor_);
+                else if (id == IDC_SVC_TITLE) { SetTextColor(dc, kAccent); SelectObject(dc, fontSmall_); }
+                else if (id == IDC_SVC_HINT) { SetTextColor(dc, kMuted); SelectObject(dc, fontSmall_); }
                 else if (id == IDC_MSG) SetTextColor(dc, msgColor_);
                 else if (id == IDC_HINT || id == IDC_LBL_ADDR || id == IDC_LBL_KEY || id == IDC_LBL_RADDR ||
                          id == IDC_LBL_RKEY) SetTextColor(dc, kMuted);
@@ -567,7 +514,12 @@ private:
                 switch (LOWORD(w)) {
                     case IDC_SHARE: ToggleSharing(); break;
                     case IDC_CONNECT: Connect(); break;
-                    case IDC_DISCONNECT: host_.kick = true; break;
+                    case IDC_DISCONNECT:
+                        if (CurrentView().viaService) StatusReader::Kick(); else host_.kick = true;
+                        break;
+                    case IDC_SVC_BTN:
+                        ServiceAction(svcState_ == SvcState::NotInstalled ? L"install" : L"uninstall");
+                        break;
                     case IDC_COPY_IP: {
                         wchar_t b[64] = {};
                         GetWindowTextW(Ctrl(IDC_IPS), b, 64);
@@ -587,10 +539,12 @@ private:
                             rd::crypto::Random(hostCfg_.psk.data(), hostCfg_.psk.size());
                             cfg_->SetHostKey(hostCfg_.psk);
                             SetText(IDC_KEY, W(rd::FormatKey(hostCfg_.psk.data())));
+                            ApplyToService();
                         }
                         break;
                     case IDC_APPROVE:
                         cfg_->SetRequireApproval(IsDlgButtonChecked(h, IDC_APPROVE) == BST_CHECKED);
+                        ApplyToService();
                         break;
                     case IDC_REMOTE:
                         if (HIWORD(w) == CBN_SELCHANGE) {
@@ -599,6 +553,9 @@ private:
                         }
                         break;
                 }
+                return 0;
+            case kMsgSvcDone:
+                OnServiceDone(int(w));
                 return 0;
             case kMsgViewerClosed: {
                 auto* v = reinterpret_cast<rdv::Viewer*>(w);
@@ -611,6 +568,7 @@ private:
                 KillTimer(h, kTimerUi);
                 viewers_.clear();
                 StopSharing();
+                if (svcThread_.joinable()) svcThread_.join();
                 PostQuitMessage(0);
                 return 0;
         }
@@ -622,8 +580,13 @@ private:
     int dpi_ = 96;
     HFONT fontNormal_ = nullptr, fontBold_ = nullptr, fontTitle_ = nullptr, fontSmall_ = nullptr, fontBig_ = nullptr;
     HBRUSH cardBrush_ = nullptr;
-    COLORREF statusColor_ = kMuted, msgColor_ = kRed;
-    std::wstring lastStatus_;
+    COLORREF statusColor_ = kMuted, msgColor_ = kRed, svcColor_ = kMuted;
+    std::wstring lastStatus_, lastSvcStatus_, svcVerb_;
+    SvcState svcState_ = SvcState::NotInstalled;
+    bool svcBusy_ = false;
+    std::thread svcThread_;
+    unsigned tick_ = 0;
+    HostActiveLock ownLock_;
 
     std::unique_ptr<Config> cfg_;
     std::vector<Recent> recents_;
@@ -639,4 +602,14 @@ private:
 
 }  // namespace
 
-int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) { return App::Run(inst); }
+int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    const std::wstring mode = argc > 1 ? argv[1] : L"";
+    const std::wstring arg2 = argc > 2 ? argv[2] : L"";
+    if (argv) LocalFree(argv);
+    if (mode == L"--service") return RunServiceMain();        // started by the Service Control Manager
+    if (mode == L"--host-worker") return RunWorker();         // started by the service, in the user session
+    if (mode == L"--service-ctl") return ServiceControl(arg2);  // elevated helper: install/uninstall/start/stop
+    return App::Run(inst);
+}

@@ -36,7 +36,21 @@ the host serves one client at a time, and new-handshake requests are rate-limite
   (approval gate, disconnect, 1 s encrypted keepalive, same-IP re-pair grace of 2 minutes).
 - `client/src/viewer.h`: `Viewer` window + network/decode thread.
 - `app/main.cpp`: the GUI (`RemoteDisplay.exe`) combining both.
+- `app/service.h`: install/uninstall (elevated helper), and the service that supervises the worker.
+- `app/worker.h`: `--host-worker`, the headless host in the user session; approval prompt, log.
+- `app/shared.h`: same-user IPC (shared-memory status, kick event, "host active" lock).
 - `rd-host` / `rd-client`: thin CLI wrappers.
+
+Process model with the service installed:
+
+```
+Windows boot -> RemoteDisplayHost (LocalSystem, Session 0)
+                  | watches active console session, WTSQueryUserToken + CreateProcessAsUser
+                  v
+        RemoteDisplay.exe --host-worker  (user session) -- UDP 47800 --> viewers
+                  ^ status (shared memory) / kick (event)
+        RemoteDisplay.exe (GUI, same user)
+```
 
 ## Roadmap
 
