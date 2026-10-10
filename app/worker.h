@@ -58,6 +58,10 @@ inline int RunWorker() {
         while (!done) {
             status.Publish(st);
             if (status.KickRequested()) st.kick = true;
+            if (status.RestartRequested()) {  // settings changed (key, approval, admin mode): the service relaunches us
+                Log(log, "restart requested by the app");
+                ExitProcess(0);
+            }
 
             const int s = st.state;
             if (s != lastState) {

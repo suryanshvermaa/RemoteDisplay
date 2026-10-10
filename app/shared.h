@@ -11,6 +11,7 @@
 
 #include "common.h"
 #include "host.h"
+#include "ipc_security.h"
 
 namespace rdapp {
 
@@ -23,6 +24,7 @@ public:
 
 constexpr wchar_t kStatusMapName[] = L"Local\\RemoteDisplayStatus";
 constexpr wchar_t kKickEventName[] = L"Local\\RemoteDisplayKick";
+constexpr wchar_t kRestartEventName[] = L"Local\\RemoteDisplayRestart";
 constexpr wchar_t kHostActiveName[] = L"Local\\RemoteDisplayHostActive";
 constexpr uint32_t kStatusMagic = 0x53445248;  // 'HRDS'
 
@@ -48,7 +50,7 @@ public:
     ~HostActiveLock() { Release(); }
     bool Acquire() {
         if (h_) return true;
-        HANDLE h = CreateEventW(nullptr, TRUE, FALSE, kHostActiveName);
+        HANDLE h = CreateEventW(IpcSecurity(), TRUE, FALSE, kHostActiveName);
         if (!h) return false;
         if (GetLastError() == ERROR_ALREADY_EXISTS) {
             CloseHandle(h);
@@ -72,13 +74,15 @@ public:
         if (view_) UnmapViewOfFile(view_);
         if (map_) CloseHandle(map_);
         if (kick_) CloseHandle(kick_);
+        if (restart_) CloseHandle(restart_);
     }
     bool Create() {
-        map_ = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(SharedStatus), kStatusMapName);
+        map_ = CreateFileMappingW(INVALID_HANDLE_VALUE, IpcSecurity(), PAGE_READWRITE, 0, sizeof(SharedStatus), kStatusMapName);
         if (!map_) return false;
         view_ = static_cast<SharedStatus*>(MapViewOfFile(map_, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SharedStatus)));
-        kick_ = CreateEventW(nullptr, FALSE, FALSE, kKickEventName);  // auto-reset
-        return view_ && kick_;
+        kick_ = CreateEventW(IpcSecurity(), FALSE, FALSE, kKickEventName);  // auto-reset
+        restart_ = CreateEventW(IpcSecurity(), FALSE, FALSE, kRestartEventName);
+        return view_ && kick_ && restart_;
     }
     void Publish(rdh::HostStatus& st) {
         SharedStatus s = {};
@@ -94,9 +98,10 @@ public:
         memcpy(view_, &s, sizeof(s));
     }
     bool KickRequested() { return WaitForSingleObject(kick_, 0) == WAIT_OBJECT_0; }
+    bool RestartRequested() { return restart_ && WaitForSingleObject(restart_, 0) == WAIT_OBJECT_0; }
 
 private:
-    HANDLE map_ = nullptr, kick_ = nullptr;
+    HANDLE map_ = nullptr, kick_ = nullptr, restart_ = nullptr;
     SharedStatus* view_ = nullptr;
 };
 
@@ -125,8 +130,13 @@ public:
     }
     // Ends the worker so the service relaunches it (used after the key/approval setting changes).
     static void RestartWorker(uint32_t pid) {
-        HANDLE p = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
-        if (p) {
+        // An event, not TerminateProcess: a normal-rights process may not terminate an elevated worker.
+        if (HANDLE e = OpenEventW(EVENT_MODIFY_STATE, FALSE, kRestartEventName)) {
+            SetEvent(e);
+            CloseHandle(e);
+            return;
+        }
+        if (HANDLE p = OpenProcess(PROCESS_TERMINATE, FALSE, pid)) {  // older worker without the event
             TerminateProcess(p, 0);
             CloseHandle(p);
         }

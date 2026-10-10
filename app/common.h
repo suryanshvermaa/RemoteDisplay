@@ -115,6 +115,8 @@ public:
     bool RequireApproval() const { return Get(L"host", L"approve") != "0"; }
     bool AllowControl() const { return Get(L"host", L"control") != "0"; }
     bool ShowTray() const { return Get(L"app", L"tray") != "0"; }  // default: show the tray icon
+    bool AdminMode() const { return Get(L"app", L"admin") == "1"; }  // default: normal rights
+    void SetAdminMode(bool v) const { Set(L"app", L"admin", v ? "1" : "0"); }
     void SetShowTray(bool v) const { Set(L"app", L"tray", v ? "1" : "0"); }
     void SetAllowControl(bool v) const { Set(L"host", L"control", v ? "1" : "0"); }
     void SetRequireApproval(bool v) const { Set(L"host", L"approve", v ? "1" : "0"); }

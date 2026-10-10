@@ -29,9 +29,20 @@ so the remote PC's keyboard layout decides the characters. Keys and mouse button
 the remote PC if the viewer loses focus, closes or disconnects. Because you can open Windows
 Settings and other apps this way, you can change the remote PC's settings.
 
-The sharing PC gets an "Allow this connection?" prompt for each new client (can be turned off), a
-Disconnect button, an **Allow mouse and keyboard control** switch (off = view only), and the
-pairing key can be regenerated at any time. The status line says "viewing" or "controlling".
+The sharing PC gets an "Allow this device to view and control your PC?" prompt for each new device
+with three choices: **Allow once**, **Always allow this device**, or **Deny** (Deny is the default
+button). It also has a Disconnect button, an **Allow mouse and keyboard control** switch (off = view
+only), and the pairing key can be regenerated at any time. The status line says "viewing" or
+"controlling".
+
+**Trusted devices.** Every viewer has its own permanent device key (stored with Windows DPAPI). If
+you choose *Always allow this device*, that device connects later with no prompt, even after
+restarts, as long as it also has your pairing key. The host remembers only the device's public-key
+fingerprint, and the device proves itself by signing each session, so nothing that was recorded on
+the network can be replayed. *Allow once* and *Deny* remember nothing. Click **Trusted devices...**
+to see and remove them. Generating a new pairing key also locks every device out until it has the
+new key. (Reconnecting from the same IP within 20 seconds of a dropped connection skips the prompt
+too, so a network blip does not nag you.)
 
 Command-line tools for testing and headless use: `rd-host.exe` and `rd-client.exe`.
 
@@ -65,10 +76,30 @@ all, so keep the pairing key private.
 
 ### Windows service (optional, needs admin)
 
-In the **Background service** section of the sharing card, click **Install** (Windows asks for
-administrator approval). That installs `RemoteDisplayHost`, which starts with Windows, adds a
+In the **Run in background** section of the sharing card, click **Install service** (Windows asks
+for administrator approval). That installs `RemoteDisplayHost`, which starts with Windows, adds a
 Windows Firewall rule for UDP 47800 on private/domain networks, and keeps this PC shareable
-without opening the app. **Remove** uninstalls it and deletes the rule.
+without opening the app. **Uninstall service** (greyed out until it is installed; it asks to
+confirm) stops and deletes the service and removes the firewall rule; the app and your settings
+stay. From a command prompt, as administrator: `RemoteDisplay.exe --service-ctl uninstall`.
+
+### Administrator rights (optional)
+
+Windows refuses mouse and keyboard input from a normal program into an **elevated** window (Task
+Manager run as admin, Registry Editor, installers). To drive those remotely, tick **Run as
+administrator** (one UAC prompt) or click **Restart as admin** to relaunch elevated right now. It
+also applies to the other two ways of running:
+
+- **Start with Windows** then uses a Scheduled Task with "highest privileges" (created once, no
+  prompt at each sign-in) instead of the normal startup entry, which Windows can never start elevated.
+- **The service** launches its worker with your own account's full-rights token (your account must be
+  an administrator; no password is stored or needed).
+
+Untick it to go back; it only changes the start-up entry and the service's worker. Still not
+possible even with admin rights: the **UAC consent screen** and the **lock screen** run on Windows'
+secure desktop, which needs a separate SYSTEM-level component that is not built yet. Running the
+whole app as administrator means a connected viewer can do anything an administrator can do on this
+PC, so only enable it on a PC where you accept that, and keep the pairing key private.
 
 How it works: screen capture cannot run inside a service (Session 0 has no desktop), so the service
 only supervises. It launches `RemoteDisplay.exe --host-worker` into the signed-in user's session as
@@ -93,8 +124,8 @@ Logs: `%ProgramData%\RemoteDisplay\service.log` and `%APPDATA%\RemoteDisplay\wor
 
 ## Current limits
 
-- **Elevated windows**: input cannot reach admin (UAC-elevated) windows, UAC prompts, the lock screen
-  or Ctrl+Alt+Del; that needs a SYSTEM-level helper (not built yet).
+- **UAC prompt and lock screen**: not viewable or controllable (secure desktop), nor Ctrl+Alt+Del;
+  admin windows work once you enable administrator rights (see above).
 - No clipboard or file transfer, no audio; characters typed with an IME or dead keys are not
   forwarded as text (keys are sent by scancode).
 - **Same network or a reachable address**: no relay or NAT traversal yet, so over the internet you

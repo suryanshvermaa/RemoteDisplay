@@ -278,6 +278,27 @@ private:
         loggedNoUser_ = false;
         HANDLE tok = nullptr;
         BOOL ok = DuplicateTokenEx(userTok, MAXIMUM_ALLOWED, nullptr, SecurityImpersonation, TokenPrimary, &tok);
+        bool elevated = false;
+        if (ok && GetElevateWorker()) {
+            // An administrator signed in with UAC has two tokens: the everyday filtered one (what we
+            // got) and a linked full-rights one. Using the linked one needs no prompt and is the same
+            // account, so the worker can drive elevated windows. Standard users have no such token.
+            TOKEN_ELEVATION_TYPE type = TokenElevationTypeDefault;
+            DWORD got = 0;
+            if (GetTokenInformation(userTok, TokenElevationType, &type, sizeof(type), &got) && type == TokenElevationTypeLimited) {
+                TOKEN_LINKED_TOKEN lt = {};
+                if (GetTokenInformation(userTok, TokenLinkedToken, &lt, sizeof(lt), &got)) {
+                    HANDLE full = nullptr;
+                    if (DuplicateTokenEx(lt.LinkedToken, MAXIMUM_ALLOWED, nullptr, SecurityImpersonation, TokenPrimary, &full)) {
+                        CloseHandle(tok);
+                        tok = full;
+                        elevated = true;
+                    }
+                    CloseHandle(lt.LinkedToken);
+                }
+            }
+            if (!elevated) Log(log_, "administrator mode is on, but this user has no elevated token; worker runs with normal rights");
+        }
         CloseHandle(userTok);
         if (!ok) {
             Log(log_, "DuplicateTokenEx failed (error %lu)", GetLastError());
@@ -306,7 +327,7 @@ private:
         proc_ = pi.hProcess;
         session_ = sid;
         backoffMs_ = 5000;  // minimum gap between starts
-        Log(log_, "worker launched in session %lu (pid %lu)", sid, pi.dwProcessId);
+        Log(log_, "worker launched in session %lu (pid %lu)%s", sid, pi.dwProcessId, elevated ? " with administrator rights" : "");
     }
 
     std::wstring log_;

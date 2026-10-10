@@ -14,6 +14,7 @@
 #include <thread>
 #include <vector>
 
+#include "admin.h"
 #include "common.h"
 #include "host.h"
 #include "service.h"
@@ -37,8 +38,9 @@ enum Ctl {
     IDC_IPS = 100, IDC_COPY_IP, IDC_KEY, IDC_COPY_KEY, IDC_NEW_KEY, IDC_APPROVE, IDC_SHARE, IDC_STATUS,
     IDC_DISCONNECT, IDC_REMOTE, IDC_REMOTE_KEY, IDC_CONNECT, IDC_MSG, IDC_HINT,
     IDC_LBL_ADDR, IDC_LBL_KEY, IDC_LBL_RADDR, IDC_LBL_RKEY, IDC_TITLE_L, IDC_TITLE_R,
-    IDC_SVC_TITLE, IDC_SVC_STATUS, IDC_SVC_BTN, IDC_SVC_HINT, IDC_CONTROL, IDC_AUTOSTART, IDC_SHOWTRAY, IDC_TRUSTED,
+    IDC_SVC_TITLE, IDC_SVC_STATUS, IDC_SVC_BTN, IDC_SVC_HINT, IDC_CONTROL, IDC_AUTOSTART, IDC_SHOWTRAY, IDC_TRUSTED, IDC_ADMIN, IDC_ADMIN_STATE, IDC_SVC_REMOVE,
 };
+enum class Elev { SvcInstall, SvcUninstall, AdminOn, AdminOff, TaskOn, TaskOff };
 enum TrayCmd { IDM_OPEN = 2001, IDM_TOGGLE, IDM_DISCONNECT, IDM_EXIT };
 constexpr UINT kMsgViewerClosed = WM_APP + 10, kMsgSvcDone = WM_APP + 11, kMsgTray = WM_APP + 20,
                kMsgShow = WM_APP + 21;
@@ -102,7 +104,7 @@ HICON MakeIcon(int n, COLORREF dot, bool showDot) {
 
 class App {
 public:
-    static int Run(HINSTANCE inst, bool background) {
+    static int Run(HINSTANCE inst, bool background, bool autoShare) {
         WSADATA wsa;
         WSAStartup(MAKEWORD(2, 2), &wsa);
         timeBeginPeriod(1);
@@ -120,8 +122,9 @@ public:
         App app;
         app.inst_ = inst;
         app.background_ = background;
+        app.autoShare_ = autoShare;
         app.dpi_ = GetDeviceCaps(GetDC(nullptr), LOGPIXELSX);
-        RECT rc = {0, 0, app.S(820), app.S(570)};
+        RECT rc = {0, 0, app.S(820), app.S(626)};
         AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
         HWND h = CreateWindowW(L"RemoteDisplayApp", L"RemoteDisplay",
                                WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN,
@@ -202,8 +205,11 @@ private:
         Add(L"STATIC", L"RUN IN BACKGROUND", SS_LEFT, 44, 444, 200, 16, IDC_SVC_TITLE);
         Add(L"BUTTON", L"Start with Windows", BS_AUTOCHECKBOX | WS_TABSTOP, 44, 464, 170, 24, IDC_AUTOSTART);
         Add(L"BUTTON", L"Show tray icon", BS_AUTOCHECKBOX | WS_TABSTOP, 224, 464, 140, 24, IDC_SHOWTRAY);
-        Add(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS, 44, 496, 196, 22, IDC_SVC_STATUS);
-        Add(L"BUTTON", L"Install", BS_PUSHBUTTON | WS_TABSTOP, 244, 492, 120, 28, IDC_SVC_BTN);
+        Add(L"BUTTON", L"Run as administrator", BS_AUTOCHECKBOX | WS_TABSTOP, 44, 492, 190, 24, IDC_ADMIN);
+        Add(L"BUTTON", L"Restart as admin", BS_PUSHBUTTON | WS_TABSTOP, 244, 490, 120, 26, IDC_ADMIN_STATE);
+        Add(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS, 44, 524, 320, 22, IDC_SVC_STATUS);
+        Add(L"BUTTON", L"Install service", BS_PUSHBUTTON | WS_TABSTOP, 44, 550, 150, 28, IDC_SVC_BTN);
+        Add(L"BUTTON", L"Uninstall service", BS_PUSHBUTTON | WS_TABSTOP, 204, 550, 160, 28, IDC_SVC_REMOVE);
 
         // ---- right card: connect
         Add(L"STATIC", L"REMOTE PC", SS_LEFT, 436, 108, 200, 16, IDC_LBL_RADDR + 100);
@@ -233,8 +239,16 @@ private:
         }
         showTray_ = cfg_->ShowTray();
         CheckDlgButton(hwnd_, IDC_SHOWTRAY, showTray_ ? BST_CHECKED : BST_UNCHECKED);
-        CheckDlgButton(hwnd_, IDC_AUTOSTART, IsStartupEnabled() ? BST_CHECKED : BST_UNCHECKED);
+        adminPref_ = cfg_->AdminMode();
+        CheckDlgButton(hwnd_, IDC_AUTOSTART, IsAutostartEnabled() ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hwnd_, IDC_ADMIN, adminPref_ ? BST_CHECKED : BST_UNCHECKED);
+        if (IsElevated()) SetWindowTextW(hwnd_, L"RemoteDisplay (Administrator)");
+        UpdateAdminUi();
         taskbarCreated_ = RegisterWindowMessageW(L"TaskbarCreated");  // Explorer restarted: re-add the icon
+        // When elevated, messages from the normal-rights shell are dropped unless allowed on purpose.
+        AllowMessageFromLowerIntegrity(hwnd_, kMsgTray);
+        AllowMessageFromLowerIntegrity(hwnd_, kMsgShow);
+        AllowMessageFromLowerIntegrity(hwnd_, taskbarCreated_);
         for (int i = 0; i < 3; ++i) {
             const COLORREF cols[3] = {RGB(156, 163, 175), kGreen, kAmber};
             trayIcons_[i] = MakeIcon(GetSystemMetrics(SM_CXSMICON), cols[i], true);
@@ -242,9 +256,9 @@ private:
         SetTimer(hwnd_, kTimerUi, 250, nullptr);
         UpdateUi();
         AddTray();
-        if (background_ && svcState_ != SvcState::Running && !Sharing()) {  // started with Windows: just start sharing
+        if ((background_ || autoShare_) && svcState_ != SvcState::Running && !Sharing()) {  // started with Windows / restarted
             ToggleSharing();
-            Balloon(L"RemoteDisplay is running", L"Sharing is on. Open it from the tray icon.");
+            if (background_) Balloon(L"RemoteDisplay is running", L"Sharing is on. Open it from the tray icon.");
         }
     }
 
@@ -366,33 +380,101 @@ private:
         }
     }
 
-    void ServiceAction(const wchar_t* verb) {
+    // One mechanism for everything that needs an administrator: run an elevated copy of this exe with
+    // `args` (UAC prompt), wait for it on a helper thread, then finish in OnElevatedDone().
+    void ElevatedAction(const std::wstring& args, Elev tag) {
         if (svcBusy_) return;
         if (svcThread_.joinable()) svcThread_.join();
-        if (std::wstring(verb) == L"install" && Sharing()) StopSharing();  // free the port for the service
+        if (tag == Elev::SvcInstall && Sharing()) StopSharing();  // free the port for the service
         svcBusy_ = true;
+        elevTag_ = tag;
         SetText(IDC_SVC_STATUS, L"Waiting for administrator approval...");
         EnableWindow(Ctrl(IDC_SVC_BTN), FALSE);
-        svcVerb_ = verb;
-        svcThread_ = std::thread([this, verb] {
-            int rc = RunElevated(hwnd_, std::wstring(L"--service-ctl ") + verb);
+        EnableWindow(Ctrl(IDC_SVC_REMOVE), FALSE);
+        svcThread_ = std::thread([this, args] {
+            const int rc = RunElevated(hwnd_, args);
             PostMessage(hwnd_, kMsgSvcDone, WPARAM(rc), 0);
         });
     }
 
-    void OnServiceDone(int rc) {
+    std::wstring UserArg() { return L" --user \"" + CurrentUserName() + L"\""; }
+
+    void UpdateAdminUi() {
+        const bool el = IsElevated();
+        SetText(IDC_ADMIN_STATE, el ? L"Running as admin" : L"Restart as admin");
+        EnableWindow(Ctrl(IDC_ADMIN_STATE), !el);
+    }
+
+    void RestartElevatedNow() {
+        if (IsElevated()) return;
+        if (RestartAsAdmin(hwnd_, Sharing())) {  // the new copy waits for this one to exit
+            forceExit_ = true;
+            DestroyWindow(hwnd_);
+        } else {
+            Message(L"Cancelled. Administrator approval is needed for this.");
+        }
+    }
+
+    void OnElevatedDone(int rc) {
         if (svcThread_.joinable()) svcThread_.join();
         svcBusy_ = false;
         svcState_ = QueryServiceState();
-        if (rc == 0) {
-            Message(svcVerb_ == L"install" ? L"Background service installed and running."
-                                           : L"Background service removed.", kGreen);
-        } else if (rc == -1) {
-            Message(L"Cancelled. Administrator approval is needed for this.");
-        } else {
-            Message(L"Service command failed (code " + std::to_wstring(rc) + L"). See ProgramData\\RemoteDisplay\\service.log");
+        const bool ok = rc == 0;
+        auto fail = [&] {
+            if (rc == -1) Message(L"Cancelled. Administrator approval is needed for this.");
+            else Message(L"That did not work (code " + std::to_wstring(rc) + L"). See ProgramData\\RemoteDisplay\\service.log");
+        };
+        switch (elevTag_) {
+            case Elev::SvcInstall:
+                if (ok) Message(L"Background service installed and running.", kGreen); else fail();
+                break;
+            case Elev::SvcUninstall:
+                if (ok) Message(L"Background service removed.", kGreen); else fail();
+                break;
+            case Elev::AdminOn:
+                if (ok) {
+                    adminPref_ = true;
+                    cfg_->SetAdminMode(true);
+                    if (IsDlgButtonChecked(hwnd_, IDC_AUTOSTART) == BST_CHECKED) SetStartupEnabled(false);  // the elevated task starts it now
+                    ApplyToService();  // the service relaunches its worker elevated
+                    Message(L"Administrator mode is on for start-up and the service.", kGreen);
+                    if (!IsElevated() &&
+                        MessageBoxW(hwnd_, L"Restart RemoteDisplay as administrator now?\n\nSharing pauses for a moment while it restarts.",
+                                    L"RemoteDisplay", MB_YESNO | MB_ICONQUESTION) == IDYES)
+                        RestartElevatedNow();
+                } else {
+                    CheckDlgButton(hwnd_, IDC_ADMIN, BST_UNCHECKED);
+                    fail();
+                }
+                break;
+            case Elev::AdminOff:
+                if (ok) {
+                    adminPref_ = false;
+                    cfg_->SetAdminMode(false);
+                    if (IsDlgButtonChecked(hwnd_, IDC_AUTOSTART) == BST_CHECKED) SetStartupEnabled(true);  // back to the normal entry
+                    ApplyToService();
+                    Message(L"Administrator mode is off. It applies the next time RemoteDisplay starts.", kMuted);
+                } else {
+                    CheckDlgButton(hwnd_, IDC_ADMIN, BST_CHECKED);
+                    fail();
+                }
+                break;
+            case Elev::TaskOn:
+                if (ok) {
+                    SetStartupEnabled(false);  // only the elevated task may start it, or the normal copy would win the race
+                    Message(L"RemoteDisplay will start as administrator when you sign in.", kGreen);
+                } else {
+                    CheckDlgButton(hwnd_, IDC_AUTOSTART, BST_UNCHECKED);
+                    fail();
+                }
+                break;
+            case Elev::TaskOff:
+                if (ok) Message(L"Will no longer start with Windows.", kMuted);
+                else { CheckDlgButton(hwnd_, IDC_AUTOSTART, BST_CHECKED); fail(); }
+                break;
         }
         UpdateUi();
+        UpdateAdminUi();
     }
 
     void ToggleSharing() {
@@ -478,8 +560,9 @@ private:
                 SetText(IDC_SVC_STATUS, ss);
                 InvalidateRect(Ctrl(IDC_SVC_STATUS), nullptr, TRUE);
             }
-            SetText(IDC_SVC_BTN, btn);
-            EnableWindow(Ctrl(IDC_SVC_BTN), TRUE);
+            const bool installed = svcState_ != SvcState::NotInstalled;
+            EnableWindow(Ctrl(IDC_SVC_BTN), !installed);
+            EnableWindow(Ctrl(IDC_SVC_REMOVE), installed);
         }
     }
 
@@ -672,14 +755,14 @@ private:
         HBRUSH card = CreateSolidBrush(kCard);
         SelectObject(mem, pen);
         SelectObject(mem, card);
-        RoundRect(mem, S(24), S(96), S(404), S(534), S(14), S(14));
-        RoundRect(mem, S(416), S(96), S(796), S(534), S(14), S(14));
+        RoundRect(mem, S(24), S(96), S(404), S(592), S(14), S(14));
+        RoundRect(mem, S(416), S(96), S(796), S(592), S(14), S(14));
         DeleteObject(pen);
         DeleteObject(card);
 
         SetTextColor(mem, kMuted);
         SelectObject(mem, fontSmall_);
-        TextOutW(mem, S(26), S(546), L"AES-128-GCM encrypted. Connections need your pairing key.", 56);
+        TextOutW(mem, S(26), S(604), L"AES-128-GCM encrypted. Connections need your pairing key.", 56);
 
         BitBlt(dc, 0, 0, cr.right, cr.bottom, mem, 0, 0, SRCCOPY);
         SelectObject(mem, old);
@@ -841,8 +924,25 @@ private:
                         Message(on ? L"Tray icon shown." : L"Tray icon hidden. Launch RemoteDisplay again to open it.", kMuted);
                         break;
                     }
+                    case IDC_ADMIN: {
+                        const bool on = IsDlgButtonChecked(h, IDC_ADMIN) == BST_CHECKED;
+                        if (svcBusy_) { CheckDlgButton(h, IDC_ADMIN, on ? BST_UNCHECKED : BST_CHECKED); break; }
+                        const bool autostart = IsDlgButtonChecked(h, IDC_AUTOSTART) == BST_CHECKED;
+                        const wchar_t* verbs = on ? (autostart ? L"worker-on,task-on" : L"worker-on") : L"worker-off,task-off";
+                        ElevatedAction(std::wstring(L"--admin-ctl ") + verbs + UserArg(), on ? Elev::AdminOn : Elev::AdminOff);
+                        break;
+                    }
+                    case IDC_ADMIN_STATE:
+                        RestartElevatedNow();
+                        break;
                     case IDC_AUTOSTART: {
                         const bool on = IsDlgButtonChecked(h, IDC_AUTOSTART) == BST_CHECKED;
+                        if (adminPref_) {  // administrator mode: start-up goes through an elevated Scheduled Task
+                            if (svcBusy_) { CheckDlgButton(h, IDC_AUTOSTART, on ? BST_UNCHECKED : BST_CHECKED); break; }
+                            ElevatedAction(std::wstring(L"--admin-ctl ") + (on ? L"task-on" : L"task-off") + UserArg(),
+                                           on ? Elev::TaskOn : Elev::TaskOff);
+                            break;
+                        }
                         if (!SetStartupEnabled(on)) {
                             CheckDlgButton(h, IDC_AUTOSTART, on ? BST_UNCHECKED : BST_CHECKED);
                             Message(L"Could not change the startup setting.");
@@ -857,7 +957,15 @@ private:
                         if (CurrentView().viaService) StatusReader::Kick(); else host_.kick = true;
                         break;
                     case IDC_SVC_BTN:
-                        ServiceAction(svcState_ == SvcState::NotInstalled ? L"install" : L"uninstall");
+                        if (svcState_ == SvcState::NotInstalled) ElevatedAction(L"--service-ctl install", Elev::SvcInstall);
+                        break;
+                    case IDC_SVC_REMOVE:
+                        if (svcState_ != SvcState::NotInstalled &&
+                            MessageBoxW(h, L"Uninstall the RemoteDisplay background service?\n\n"
+                                           L"This PC will no longer start sharing when Windows starts. It also removes the firewall rule "
+                                           L"the installer added. The app itself and your settings stay.",
+                                        L"RemoteDisplay", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES)
+                            ElevatedAction(L"--service-ctl uninstall", Elev::SvcUninstall);
                         break;
                     case IDC_COPY_IP: {
                         wchar_t b[64] = {};
@@ -899,7 +1007,7 @@ private:
                 }
                 return 0;
             case kMsgSvcDone:
-                OnServiceDone(int(w));
+                OnElevatedDone(int(w));
                 return 0;
             case kMsgViewerClosed: {
                 auto* v = reinterpret_cast<rdv::Viewer*>(w);
@@ -936,6 +1044,8 @@ private:
     rd::DeviceIdentity identity_;
     PromptHandle promptHandle_;
 
+    bool adminPref_ = false, autoShare_ = false;
+    Elev elevTag_ = Elev::SvcInstall;
     bool background_ = false, forceExit_ = false, tipShown_ = false, trayAdded_ = false, showTray_ = true;
     UINT taskbarCreated_ = 0;
     HICON trayIcons_[3] = {};
@@ -961,26 +1071,43 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     const std::wstring mode = argc > 1 ? argv[1] : L"";
     const std::wstring arg2 = argc > 2 ? argv[2] : L"";
-    bool background = false, multiple = false;
+    bool background = false, multiple = false, share = false;
+    DWORD waitPid = 0;
+    std::wstring user;
     for (int i = 1; i < argc; ++i) {
-        if (std::wstring(argv[i]) == L"--background") background = true;
-        if (std::wstring(argv[i]) == L"--allow-multiple") multiple = true;
+        const std::wstring a = argv[i];
+        if (a == L"--background") background = true;
+        else if (a == L"--allow-multiple") multiple = true;
+        else if (a == L"--share") share = true;
+        else if (a == L"--wait-pid" && i + 1 < argc) waitPid = DWORD(_wtoi(argv[++i]));
+        else if (a == L"--user" && i + 1 < argc) user = argv[++i];
     }
     if (argv) LocalFree(argv);
-    if (mode == L"--service") return RunServiceMain();        // started by the Service Control Manager
-    if (mode == L"--host-worker") return RunWorker();         // started by the service, in the user session
+    if (mode == L"--service") return RunServiceMain();          // started by the Service Control Manager
+    if (mode == L"--host-worker") return RunWorker();           // started by the service, in the user session
     if (mode == L"--service-ctl") return ServiceControl(arg2);  // elevated helper: install/uninstall/start/stop
+    if (mode == L"--admin-ctl") return AdminControl(arg2, user);  // elevated helper: administrator-mode settings
 
-    // One app per user session: a second launch just brings the first one to the front.
+    if (waitPid) {  // restarted by a previous copy (e.g. "Restart as administrator"): let it finish exiting first
+        if (HANDLE p = OpenProcess(SYNCHRONIZE, FALSE, waitPid)) {
+            WaitForSingleObject(p, 15'000);
+            CloseHandle(p);
+        }
+    }
+
+    // One app per user session: a second launch just brings the first one to the front. The mutex has an
+    // explicit ACL so a normal-rights launch can still see an elevated copy (otherwise it gets "access
+    // denied" and would start a duplicate).
     HANDLE single = nullptr;
     if (!multiple) {
-        single = CreateMutexW(nullptr, FALSE, L"Local\\RemoteDisplayApp");
-        if (single && GetLastError() == ERROR_ALREADY_EXISTS) {
+        single = CreateMutexW(IpcSecurity(), FALSE, L"Local\\RemoteDisplayApp");
+        const DWORD err = GetLastError();
+        if (err == ERROR_ALREADY_EXISTS || (!single && err == ERROR_ACCESS_DENIED)) {
             if (!background) {
                 if (HWND existing = FindWindowW(L"RemoteDisplayApp", nullptr)) PostMessage(existing, kMsgShow, 0, 0);
             }
             return 0;
         }
     }
-    return App::Run(inst, background);
+    return App::Run(inst, background, share);
 }
