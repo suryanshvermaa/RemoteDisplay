@@ -6,6 +6,7 @@
 #include <thread>
 
 #include "host.h"
+#include "secure_feed.h"  // test mode only, see RD_SECURE_TEST below
 
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
@@ -35,6 +36,14 @@ int main(int argc, char** argv) {
     std::atomic<bool> stop{false};
     rdh::HostStatus st;
     st.state = rdh::HostStatus::Starting;  // set before the thread runs so "Stopped" means finished
+    // Test mode (RD_SECURE_TEST=1): frames come from the secure-desktop helper's shared picture instead of
+    // our own capture, so viewer checks cover the handoff, upload and encode of that path. Start the helper
+    // yourself first: RemoteDisplay.exe --secure-helper --force (a separate process, as in production).
+    static rdapp::SecureFeedReader secureFeed;
+    if (getenv("RD_SECURE_TEST")) {
+        cfg.secure = &secureFeed;
+        printf("TEST MODE: frames come through the secure-desktop path\n");
+    }
     std::thread t([&] { rdh::RunHost(cfg, stop, st); });
     static const char* names[] = {"stopped", "starting", "waiting for client", "awaiting approval",
                                   "streaming", "error"};

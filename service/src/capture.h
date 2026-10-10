@@ -36,6 +36,7 @@ public:
 
         dev_.Reset();
         ctx_.Reset();
+        staging_.Reset();
         if (HRESULT e = D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
                                          D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT,
                                          nullptr, 0, D3D11_SDK_VERSION, &dev_, nullptr, &ctx_); FAILED(e))
@@ -75,7 +76,46 @@ public:
         res.As(&desktop);
         ctx_->CopyResource(bgra_.Get(), desktop.Get());
         dupl_->ReleaseFrame();
+        return Convert(lost);
+    }
 
+    // Uploads a BGRA picture from system memory (the secure-desktop helper's copy) and converts it the
+    // same way as a desktop frame. nullptr if the size differs from this output.
+    ID3D11Texture2D* UploadBgra(const uint8_t* src, UINT srcPitch, UINT w, UINT h) {
+        if (w != bgraW_ || h != bgraH_ || !src) return nullptr;
+        ctx_->UpdateSubresource(bgra_.Get(), 0, nullptr, src, srcPitch, 0);
+        bool lost = false;
+        return Convert(lost);
+    }
+
+    // Copies the picture last written to bgra_ into system memory (secure-desktop helper only).
+    bool ReadBgra(std::vector<uint8_t>& out, UINT& pitch) {
+        if (!staging_) {
+            D3D11_TEXTURE2D_DESC td = {};
+            bgra_->GetDesc(&td);
+            td.Usage = D3D11_USAGE_STAGING;
+            td.BindFlags = 0;
+            td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            td.MiscFlags = 0;
+            if (FAILED(dev_->CreateTexture2D(&td, nullptr, &staging_))) return false;
+        }
+        ctx_->CopyResource(staging_.Get(), bgra_.Get());
+        D3D11_MAPPED_SUBRESOURCE m = {};
+        if (FAILED(ctx_->Map(staging_.Get(), 0, D3D11_MAP_READ, 0, &m))) return false;
+        pitch = m.RowPitch;
+        out.resize(size_t(pitch) * bgraH_);
+        for (UINT y = 0; y < bgraH_; ++y)
+            memcpy(out.data() + size_t(y) * pitch, static_cast<const uint8_t*>(m.pData) + size_t(y) * m.RowPitch, pitch);
+        ctx_->Unmap(staging_.Get(), 0);
+        return true;
+    }
+
+    UINT bgraWidth() const { return bgraW_; }
+    UINT bgraHeight() const { return bgraH_; }
+
+private:
+    // BGRA (bgra_) -> NV12 through the video processor, into the next ring texture.
+    ID3D11Texture2D* Convert(bool& lost) {
         ID3D11Texture2D* out = nv12Ring_[ringPos_].Get();
         ringPos_ = (ringPos_ + 1) % nv12Ring_.size();
         D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovd = {};
@@ -96,6 +136,7 @@ public:
         return out;
     }
 
+public:
     ID3D11Texture2D* Last() const { return last_; }
     const RECT& desktopRect() const { return rect_; }
 
@@ -167,6 +208,8 @@ private:
         td.Width = dd.ModeDesc.Width;
         td.Height = dd.ModeDesc.Height;
         if (HRESULT e = dev_->CreateTexture2D(&td, nullptr, &bgra_); FAILED(e)) CAP_FAIL("create BGRA texture", e);
+        bgraW_ = td.Width;
+        bgraH_ = td.Height;
 
         td.Width = width_;
         td.Height = height_;
@@ -212,7 +255,8 @@ private:
     ComPtr<ID3D11Device> dev_;
     ComPtr<ID3D11DeviceContext> ctx_;
     ComPtr<IDXGIOutputDuplication> dupl_;
-    ComPtr<ID3D11Texture2D> bgra_;
+    ComPtr<ID3D11Texture2D> bgra_, staging_;
+    UINT bgraW_ = 0, bgraH_ = 0;
     std::vector<ComPtr<ID3D11Texture2D>> nv12Ring_;
     size_t ringPos_ = 0;
     ID3D11Texture2D* last_ = nullptr;

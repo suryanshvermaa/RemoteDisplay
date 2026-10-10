@@ -30,6 +30,17 @@ struct TrustStore {
     virtual void Remember(const rd::DeviceId& id, const std::string& name) = 0;
 };
 
+// Frames from the secure-desktop helper (UAC prompt / sign-in screen). Set only when the service runs
+// the helper and the administrator allowed it; otherwise the host captures the desktop itself.
+struct SecureSource {
+    virtual ~SecureSource() = default;
+    // True while the helper reports the secure desktop is the input desktop (and is alive).
+    virtual bool Active() = 0;
+    // Uploads the newest secure frame into `cap` and returns it. Without `needFrame` it returns nullptr
+    // unless the frame is new; with it (a viewer needs a picture now) it returns the current frame.
+    virtual ID3D11Texture2D* Upload(Capture& cap, bool needFrame) = 0;
+};
+
 struct HostConfig {
     std::string listenIp = "0.0.0.0";
     int port = rd::kDefaultPort;
@@ -39,6 +50,7 @@ struct HostConfig {
     bool requireApproval = true;  // hold video until the local user clicks Allow
     bool allowControl = true;     // accept mouse/keyboard input from the (approved) viewer
     TrustStore* trust = nullptr;  // devices that skip the approval prompt; may be null
+    SecureSource* secure = nullptr;  // UAC / sign-in screen frames from the helper; may be null
 };
 
 struct HostStatus {
@@ -333,13 +345,16 @@ inline void RunHost(const HostConfig& cfg, std::atomic<bool>& stop, HostStatus& 
             } else if (h.type == uint8_t(rd::PacketType::InputMove) || h.type == uint8_t(rd::PacketType::Input)) {
                 // Input only counts after the local user approved this viewer AND allows control.
                 if (st.state != HostStatus::Streaming || !cfg.allowControl) continue;
+                // The consent covers viewing the UAC prompt / sign-in screen, not typing into it: input
+                // is received and acknowledged there but never injected.
+                const bool injectOk = !(cfg.secure && cfg.secure->Active());
                 const uint8_t* body = plain + sizeof(h);
                 const size_t bl = pl - sizeof(h);
                 if (h.type == uint8_t(rd::PacketType::InputMove)) {
                     if (bl < sizeof(rd::MoveBody)) continue;
                     rd::MoveBody mb;
                     memcpy(&mb, body, sizeof(mb));
-                    inject.Move(mb.x, mb.y);
+                    if (injectOk) inject.Move(mb.x, mb.y);
                 } else {
                     if (bl < sizeof(rd::InputBody)) continue;
                     rd::InputBody ib;
@@ -353,7 +368,7 @@ inline void RunHost(const HostConfig& cfg, std::atomic<bool>& stop, HostStatus& 
                         if (seq != inputNext) break;                 // gap: viewer resends from its oldest unacked
                         rd::InputEvent ev;
                         memcpy(&ev, body + sizeof(ib) + i * sizeof(ev), sizeof(ev));
-                        inject.Apply(ev);
+                        if (injectOk) inject.Apply(ev);
                         ++inputNext;
                     }
                     detail::SendAck(sock.s, peer, active, inputNext);
@@ -381,17 +396,26 @@ inline void RunHost(const HostConfig& cfg, std::atomic<bool>& stop, HostStatus& 
         }
 
         // --- Capture + encode + send --------------------------------------------------------
+        // While the UAC prompt or sign-in screen is up, our own duplication cannot see it: take the
+        // helper's frames instead. The pointer is not available there, so no cursor is sent.
+        const bool secureNow = cfg.secure && cfg.secure->Active();
         bool lost = false;
-        ID3D11Texture2D* tex = cap.Grab(peer.valid ? 4 : 100, lost);
-        if (lost) {
-            if (!initPipeline()) Sleep(500);
-            forceKey = true;
-            continue;
+        ID3D11Texture2D* tex = nullptr;
+        if (secureNow) {
+            if (peer.valid) tex = cfg.secure->Upload(cap, forceKey);
+            else Sleep(50);  // nobody is watching yet: don't copy frames
+        } else {
+            tex = cap.Grab(peer.valid ? 4 : 100, lost);
+            if (lost) {
+                if (!initPipeline()) Sleep(500);
+                forceKey = true;
+                continue;
+            }
         }
         // The cursor shape travels separately (the picture has no pointer in it): send on change,
         // on a new client, and every 2 s so a lost fragment heals itself.
-        if (cap.TakeCursorChange()) cursorSendNow = true;
-        if (peer.valid && active.valid() && st.state == HostStatus::Streaming && !cap.CursorBlob().empty() &&
+        if (!secureNow && cap.TakeCursorChange()) cursorSendNow = true;
+        if (!secureNow && peer.valid && active.valid() && st.state == HostStatus::Streaming && !cap.CursorBlob().empty() &&
             (cursorSendNow || NowUs() - lastCursorSend > 2'000'000)) {
             detail::SendCursor(sock.s, peer, active, cap.CursorBlob(), cap.CursorId());
             lastCursorSend = NowUs();

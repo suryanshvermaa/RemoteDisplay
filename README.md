@@ -111,17 +111,32 @@ Limits: sharing starts once a user is signed in (not at the login screen), a loc
 prompt cannot be viewed yet, and if you move `RemoteDisplay.exe` you must remove and reinstall.
 Logs: `%ProgramData%\RemoteDisplay\service.log` and `%APPDATA%\RemoteDisplay\worker.log`.
 
-### Secure desktop (UAC prompt and sign-in screen): consent only, for now
+### Secure desktop (UAC prompt, sign-in and lock screen): opt-in
 
-The **Consent for UAC/sign-in viewing (admin, WIP)** checkbox is opt-in. Turning it on or off asks
-for administrator approval, so a connected viewer cannot switch it on. Current state, honestly:
+Windows draws the UAC prompt, the sign-in screen and the lock screen on a separate "secure desktop"
+that ordinary programs cannot see. RemoteDisplay can show it to a viewer, but only when all of these
+hold:
 
-- **Works:** the consent is stored machine-wide; the worker detects when the UAC prompt or sign-in
-  screen takes over the desktop; every switch is written to `%ProgramData%\RemoteDisplayudit.log`
-  with time, Windows user and process.
-- **Not built:** actually showing those screens. Capturing them needs a SYSTEM-level helper that
-  attaches to the Winlogon desktop, which is a separate piece of work and needs administrator
-  testing. Until then the viewer sees a frozen picture while a prompt is up.
+1. **The Windows service is installed** (Install service). The service runs the helper; without it
+   the secure desktop cannot be seen, and the viewer sees a frozen picture.
+2. **An administrator allowed it**: tick **Allow viewing UAC and sign-in screens (admin)** and accept
+   the UAC prompt. A connected viewer cannot change this. It is stored machine-wide.
+3. **A viewer is connected**, and the desktop is actually the secure one.
+
+What happens then:
+
+- A SYSTEM helper, started on the Winlogon desktop by the service, captures the secure desktop and
+  hands its picture to the worker through shared memory. The viewer sees the UAC prompt or sign-in
+  screen. When the normal desktop returns, the stream switches back automatically.
+- **View only.** Mouse and keyboard input is received and acknowledged, but never sent to the secure
+  desktop. You cannot type a password into a UAC prompt remotely.
+- The pointer is not shown on those screens (the viewer's own pointer is used).
+- Every switch in or out of the secure desktop is written to `%ProgramData%\RemoteDisplayudit.log`
+  with the time, Windows user and process. The helper logs to `secure-helper.log` in the same folder.
+
+Turning consent off stops the helper within a few seconds.
+
+To check it works on your PC, follow [tests/secure_desktop_manual.md](tests/secure_desktop_manual.md).
 
 ## Security model
 

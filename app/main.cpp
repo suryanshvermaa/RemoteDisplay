@@ -16,6 +16,7 @@
 
 #include "admin.h"
 #include "secure.h"
+#include "secure_helper.h"
 #include "common.h"
 #include "host.h"
 #include "service.h"
@@ -211,7 +212,7 @@ private:
         Add(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS, 44, 552, 320, 22, IDC_SVC_STATUS);
         Add(L"BUTTON", L"Install service", BS_PUSHBUTTON | WS_TABSTOP, 44, 580, 150, 28, IDC_SVC_BTN);
         Add(L"BUTTON", L"Uninstall service", BS_PUSHBUTTON | WS_TABSTOP, 204, 580, 160, 28, IDC_SVC_REMOVE);
-        Add(L"BUTTON", L"Consent for UAC/sign-in viewing (admin, WIP)", BS_AUTOCHECKBOX | WS_TABSTOP, 44, 520, 360, 24, IDC_SECURE);
+        Add(L"BUTTON", L"Allow viewing UAC and sign-in screens (admin)", BS_AUTOCHECKBOX | WS_TABSTOP, 44, 520, 360, 24, IDC_SECURE);
 
         // ---- right card: connect
         Add(L"STATIC", L"REMOTE PC", SS_LEFT, 436, 108, 200, 16, IDC_LBL_RADDR + 100);
@@ -1097,7 +1098,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     const std::wstring mode = argc > 1 ? argv[1] : L"";
     const std::wstring arg2 = argc > 2 ? argv[2] : L"";
-    bool background = false, multiple = false, share = false;
+    bool background = false, multiple = false, share = false, forceHelper = false;
     DWORD waitPid = 0;
     std::wstring user;
     for (int i = 1; i < argc; ++i) {
@@ -1105,12 +1106,14 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
         if (a == L"--background") background = true;
         else if (a == L"--allow-multiple") multiple = true;
         else if (a == L"--share") share = true;
+        else if (a == L"--force") forceHelper = true;  // with --secure-helper, for testing only
         else if (a == L"--wait-pid" && i + 1 < argc) waitPid = DWORD(_wtoi(argv[++i]));
         else if (a == L"--user" && i + 1 < argc) user = argv[++i];
     }
     if (argv) LocalFree(argv);
     if (mode == L"--service") return RunServiceMain();          // started by the Service Control Manager
     if (mode == L"--host-worker") return RunWorker();           // started by the service, in the user session
+    if (mode == L"--secure-helper") return rdapp::RunSecureHelper(forceHelper);  // started by the service as SYSTEM
     if (mode == L"--service-ctl") return ServiceControl(arg2);  // elevated helper: install/uninstall/start/stop
     if (mode == L"--admin-ctl") return AdminControl(arg2, user);  // elevated helper: administrator-mode settings
 

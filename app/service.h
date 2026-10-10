@@ -10,6 +10,7 @@
 #include <userenv.h>
 #include <winsvc.h>
 #include <wtsapi32.h>
+#include <tlhelp32.h>
 
 #include <string>
 
@@ -233,6 +234,36 @@ inline DWORD WINAPI Handler(DWORD ctl, DWORD, LPVOID, LPVOID) {
 }
 
 // Keeps exactly one worker alive in the active console session.
+// Enables one privilege on this process's own token (LocalSystem has it but starts it disabled).
+inline bool EnablePrivilege(const wchar_t* name) {
+    HANDLE t = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &t)) return false;
+    TOKEN_PRIVILEGES tp = {};
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    const bool ok = LookupPrivilegeValueW(nullptr, name, &tp.Privileges[0].Luid) &&
+                    AdjustTokenPrivileges(t, FALSE, &tp, 0, nullptr, nullptr) && GetLastError() == ERROR_SUCCESS;
+    CloseHandle(t);
+    return ok;
+}
+
+// Process id of `exe` running in session `sid`, or 0.
+inline DWORD FindProcessInSession(const wchar_t* exe, DWORD sid) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    PROCESSENTRY32W pe = {sizeof(pe)};
+    DWORD found = 0;
+    for (BOOL more = Process32FirstW(snap, &pe); more; more = Process32NextW(snap, &pe)) {
+        DWORD s = 0;
+        if (_wcsicmp(pe.szExeFile, exe) == 0 && ProcessIdToSessionId(pe.th32ProcessID, &s) && s == sid) {
+            found = pe.th32ProcessID;
+            break;
+        }
+    }
+    CloseHandle(snap);
+    return found;
+}
+
 class Supervisor {
 public:
     explicit Supervisor(std::wstring log) : log_(std::move(log)) {}
@@ -255,9 +286,11 @@ public:
             }
         }
         if (!proc_ && sid != 0xFFFFFFFF && GetTickCount64() - lastStart_ >= backoffMs_) Launch(sid);
+        ManageHelper(sid);
     }
 
     void Kill() {
+        KillHelper();
         if (!proc_) return;
         TerminateProcess(proc_, 0);
         WaitForSingleObject(proc_, 3000);
@@ -266,6 +299,81 @@ public:
     }
 
 private:
+    // ---- secure-desktop helper (UAC prompt / sign-in screen) -------------------------------------
+    // Runs only while the administrator has allowed it AND a worker is running in the same session.
+    void ManageHelper(DWORD sid) {
+        const bool want = proc_ && sid != 0xFFFFFFFF && sid == session_ && SecureDesktopAllowed();
+        if (helper_) {
+            DWORD code = 0;
+            const bool alive = GetExitCodeProcess(helper_, &code) && code == STILL_ACTIVE;
+            if (!want) {
+                Log(log_, "secure-desktop helper stopped (consent off or worker stopped)");
+                KillHelper();
+            } else if (!alive) {
+                Log(log_, "secure-desktop helper exited (code %lu); restarting", code);
+                KillHelper();
+                helperStart_ = GetTickCount64();
+                helperBackoff_ = 5000;
+            }
+        }
+        if (want && !helper_ && GetTickCount64() - helperStart_ >= helperBackoff_) LaunchHelper(sid);
+    }
+
+    void KillHelper() {
+        if (!helper_) return;
+        TerminateProcess(helper_, 0);
+        WaitForSingleObject(helper_, 3000);
+        CloseHandle(helper_);
+        helper_ = nullptr;
+    }
+
+    // Starts the helper as SYSTEM on the Winlogon desktop, using winlogon.exe's own token. winlogon.exe is
+    // the SYSTEM process that owns the secure desktop, so this is the only way an ordinary service can
+    // reach it. Nothing else here gets SYSTEM rights.
+    void LaunchHelper(DWORD sid) {
+        helperStart_ = GetTickCount64();
+        helperBackoff_ = 5000;
+        if (!EnablePrivilege(L"SeAssignPrimaryTokenPrivilege") || !EnablePrivilege(L"SeIncreaseQuotaPrivilege")) {
+            Log(log_, "secure-desktop helper: could not enable privileges (error %lu)", GetLastError());
+            return;
+        }
+        const DWORD pid = FindProcessInSession(L"winlogon.exe", sid);
+        if (!pid) {
+            Log(log_, "secure-desktop helper: winlogon.exe not found in session %lu", sid);
+            return;
+        }
+        HANDLE wp = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
+        if (!wp) {
+            Log(log_, "secure-desktop helper: cannot open winlogon.exe (error %lu)", GetLastError());
+            return;
+        }
+        HANDLE wt = nullptr, tok = nullptr;
+        bool ok = OpenProcessToken(wp, TOKEN_DUPLICATE | TOKEN_QUERY, &wt) &&
+                  DuplicateTokenEx(wt, TOKEN_ALL_ACCESS, nullptr, SecurityImpersonation, TokenPrimary, &tok);
+        if (wt) CloseHandle(wt);
+        CloseHandle(wp);
+        if (!ok) {
+            Log(log_, "secure-desktop helper: cannot get winlogon token (error %lu)", GetLastError());
+            return;
+        }
+        const std::wstring exe = ExePath();
+        std::wstring cmd = L"\"" + exe + L"\" --secure-helper";
+        std::wstring dir = exe.substr(0, exe.find_last_of(L'\\'));
+        wchar_t desktop[] = L"winsta0\\winlogon";
+        STARTUPINFOW si = {sizeof(si)};
+        si.lpDesktop = desktop;
+        PROCESS_INFORMATION pi = {};
+        ok = CreateProcessAsUserW(tok, nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, dir.c_str(), &si, &pi);
+        CloseHandle(tok);
+        if (!ok) {
+            Log(log_, "secure-desktop helper: CreateProcessAsUser failed (error %lu)", GetLastError());
+            return;
+        }
+        CloseHandle(pi.hThread);
+        helper_ = pi.hProcess;
+        Log(log_, "secure-desktop helper started in session %lu (pid %lu)", sid, pi.dwProcessId);
+    }
+
     void Launch(DWORD sid) {
         lastStart_ = GetTickCount64();
         HANDLE userTok = nullptr;
@@ -332,6 +440,8 @@ private:
 
     std::wstring log_;
     HANDLE proc_ = nullptr;
+    HANDLE helper_ = nullptr;
+    ULONGLONG helperStart_ = 0, helperBackoff_ = 0;
     DWORD session_ = 0;
     ULONGLONG lastStart_ = 0, backoffMs_ = 0;
     bool loggedNoUser_ = false;

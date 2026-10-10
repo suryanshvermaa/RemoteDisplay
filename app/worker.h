@@ -9,6 +9,7 @@
 
 #include "common.h"
 #include "secure.h"
+#include "secure_feed.h"
 #include "host.h"
 #include "shared.h"
 
@@ -37,6 +38,8 @@ inline int RunWorker() {
     hc.allowControl = cfg.AllowControl();
     ConfigTrust trust;
     hc.trust = &trust;
+    SecureFeedReader secureFeed;  // the UAC / sign-in screen picture from the helper, if it runs
+    hc.secure = &secureFeed;
     Log(log, "listening on UDP %d, approval %s, control %s", hc.port, hc.requireApproval ? "required" : "not required",
         hc.allowControl ? "allowed" : "view only");
 
@@ -57,10 +60,11 @@ inline int RunWorker() {
         PromptHandle promptHandle;
         int lastState = -1;
         bool wasSecure = false;
+        SecureFeedReader auditFeed;
         while (!done) {
             status.Publish(st);
             // Opt-in secure-desktop audit: record every time the UAC prompt / sign-in screen takes over.
-            const bool secure = OnSecureDesktop();
+            const bool secure = auditFeed.Active();  // a normal process cannot open the Winlogon desktop itself
             if (secure != wasSecure) {
                 wasSecure = secure;
                 Audit(secure ? "secure-desktop-entered" : "secure-desktop-left",

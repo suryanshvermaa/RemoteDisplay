@@ -57,6 +57,11 @@ the host serves one client at a time, and new-handshake requests are rate-limite
   machine-wide "elevate the service's worker" flag.
 - `app/admin.h`: administrator mode: elevated Scheduled Task (full XML: no 72 h limit, runs on battery),
   the HKLM flag, restart-elevated.
+- `app/secure_helper.h` and `app/secure_feed.h`: the secure-desktop helper (SYSTEM, Winlogon desktop,
+  follows the input desktop with `SetThreadDesktop`, captures only while the secure desktop is up) and the
+  shared-memory picture it hands to the worker (seqlock: a reader never gets half of one frame and half of
+  the next). The host takes these frames instead of its own capture while the secure desktop is up, and
+  drops injected input then. `service/src/host.h` (`SecureSource`) is the seam.
 - `service/include/identity.h`: per-device ECDSA identity; `Identify` signs the session's handshake
   transcript so the host can recognise devices the user chose to trust.
 - `rd-host` / `rd-client`: thin CLI wrappers.
