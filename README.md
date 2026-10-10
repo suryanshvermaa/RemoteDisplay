@@ -111,6 +111,18 @@ Limits: sharing starts once a user is signed in (not at the login screen), a loc
 prompt cannot be viewed yet, and if you move `RemoteDisplay.exe` you must remove and reinstall.
 Logs: `%ProgramData%\RemoteDisplay\service.log` and `%APPDATA%\RemoteDisplay\worker.log`.
 
+### Secure desktop (UAC prompt and sign-in screen): consent only, for now
+
+The **Consent for UAC/sign-in viewing (admin, WIP)** checkbox is opt-in. Turning it on or off asks
+for administrator approval, so a connected viewer cannot switch it on. Current state, honestly:
+
+- **Works:** the consent is stored machine-wide; the worker detects when the UAC prompt or sign-in
+  screen takes over the desktop; every switch is written to `%ProgramData%\RemoteDisplayudit.log`
+  with time, Windows user and process.
+- **Not built:** actually showing those screens. Capturing them needs a SYSTEM-level helper that
+  attaches to the Winlogon desktop, which is a separate piece of work and needs administrator
+  testing. Until then the viewer sees a frozen picture while a prompt is up.
+
 ## Security model
 
 - Every UDP datagram is AES-128-GCM encrypted and authenticated; replays are rejected.

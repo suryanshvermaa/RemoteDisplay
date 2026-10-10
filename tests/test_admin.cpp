@@ -93,6 +93,33 @@ int main() {
         CHECK(!TaskExists(), "the real 'RemoteDisplay' task was not touched");
     }
 
+    // ---- secure desktop: detection, opt-in guard, audit trail ----
+    {
+        const std::wstring desk = InputDesktopName();
+        wprintf(L"     input desktop: %ls\n", desk.c_str());
+        CHECK(!desk.empty(), "the input desktop name can be read");
+        if (!IsElevated() && !SecureDesktopAllowed()) {
+            CHECK(!SetSecureDesktopAllowed(true), "normal rights cannot turn secure-desktop consent on");
+            CHECK(!SecureDesktopAllowed(), "and consent is still off");
+        }
+        const std::wstring logPath = AuditLogPath();
+        DeleteFileW(logPath.c_str());
+        Audit("test-event", "marker=unit-test");
+        std::string text;
+        HANDLE f = CreateFileW(logPath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (f != INVALID_HANDLE_VALUE) {
+            char buf[2048];
+            DWORD n = 0;
+            while (ReadFile(f, buf, sizeof(buf), &n, nullptr) && n) text.append(buf, n);
+            CloseHandle(f);
+        }
+        CHECK(text.find("AUDIT test-event") != std::string::npos && text.find("marker=unit-test") != std::string::npos,
+              "an audit line is written with the event and detail");
+        CHECK(text.find("user=") != std::string::npos && text.find("pid=") != std::string::npos,
+              "audit lines record the user and process");
+        DeleteFileW(logPath.c_str());
+    }
+
     printf(g_fail ? "%d FAILED\n" : "all admin-plumbing tests passed\n", g_fail);
     return g_fail ? 1 : 0;
 }

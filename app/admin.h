@@ -21,6 +21,7 @@
 
 #include "common.h"
 #include "ipc_security.h"
+#include "secure.h"
 #include "service.h"
 
 #pragma comment(lib, "secur32.lib")
@@ -157,6 +158,8 @@ inline int AdminControl(const std::wstring& verbs, const std::wstring& user) {
         else if (v == L"worker-off") ok = SetElevateWorker(false);
         else if (v == L"task-on") ok = !user.empty() && CreateStartupTask(user, SelfPath());
         else if (v == L"task-off") ok = DeleteStartupTask();
+        else if (v == L"secure-on") { ok = SetSecureDesktopAllowed(true); Audit("secure-desktop-policy", "allowed=1"); }
+        else if (v == L"secure-off") { ok = SetSecureDesktopAllowed(false); Audit("secure-desktop-policy", "allowed=0"); }
         Log(log, "admin-ctl %ls: %s", v.c_str(), ok ? "ok" : "FAILED");
         if (!ok) rc = 20;
     }

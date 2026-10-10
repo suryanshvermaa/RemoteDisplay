@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "admin.h"
+#include "secure.h"
 #include "common.h"
 #include "host.h"
 #include "service.h"
@@ -38,9 +39,9 @@ enum Ctl {
     IDC_IPS = 100, IDC_COPY_IP, IDC_KEY, IDC_COPY_KEY, IDC_NEW_KEY, IDC_APPROVE, IDC_SHARE, IDC_STATUS,
     IDC_DISCONNECT, IDC_REMOTE, IDC_REMOTE_KEY, IDC_CONNECT, IDC_MSG, IDC_HINT,
     IDC_LBL_ADDR, IDC_LBL_KEY, IDC_LBL_RADDR, IDC_LBL_RKEY, IDC_TITLE_L, IDC_TITLE_R,
-    IDC_SVC_TITLE, IDC_SVC_STATUS, IDC_SVC_BTN, IDC_SVC_HINT, IDC_CONTROL, IDC_AUTOSTART, IDC_SHOWTRAY, IDC_TRUSTED, IDC_ADMIN, IDC_ADMIN_STATE, IDC_SVC_REMOVE,
+    IDC_SVC_TITLE, IDC_SVC_STATUS, IDC_SVC_BTN, IDC_SVC_HINT, IDC_CONTROL, IDC_AUTOSTART, IDC_SHOWTRAY, IDC_TRUSTED, IDC_ADMIN, IDC_ADMIN_STATE, IDC_SVC_REMOVE, IDC_SECURE,
 };
-enum class Elev { SvcInstall, SvcUninstall, AdminOn, AdminOff, TaskOn, TaskOff };
+enum class Elev { SvcInstall, SvcUninstall, AdminOn, AdminOff, TaskOn, TaskOff, SecureOn, SecureOff };
 enum TrayCmd { IDM_OPEN = 2001, IDM_TOGGLE, IDM_DISCONNECT, IDM_EXIT };
 constexpr UINT kMsgViewerClosed = WM_APP + 10, kMsgSvcDone = WM_APP + 11, kMsgTray = WM_APP + 20,
                kMsgShow = WM_APP + 21;
@@ -124,7 +125,7 @@ public:
         app.background_ = background;
         app.autoShare_ = autoShare;
         app.dpi_ = GetDeviceCaps(GetDC(nullptr), LOGPIXELSX);
-        RECT rc = {0, 0, app.S(820), app.S(626)};
+        RECT rc = {0, 0, app.S(820), app.S(660)};
         AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
         HWND h = CreateWindowW(L"RemoteDisplayApp", L"RemoteDisplay",
                                WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN,
@@ -207,9 +208,10 @@ private:
         Add(L"BUTTON", L"Show tray icon", BS_AUTOCHECKBOX | WS_TABSTOP, 224, 464, 140, 24, IDC_SHOWTRAY);
         Add(L"BUTTON", L"Run as administrator", BS_AUTOCHECKBOX | WS_TABSTOP, 44, 492, 190, 24, IDC_ADMIN);
         Add(L"BUTTON", L"Restart as admin", BS_PUSHBUTTON | WS_TABSTOP, 244, 490, 120, 26, IDC_ADMIN_STATE);
-        Add(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS, 44, 524, 320, 22, IDC_SVC_STATUS);
-        Add(L"BUTTON", L"Install service", BS_PUSHBUTTON | WS_TABSTOP, 44, 550, 150, 28, IDC_SVC_BTN);
-        Add(L"BUTTON", L"Uninstall service", BS_PUSHBUTTON | WS_TABSTOP, 204, 550, 160, 28, IDC_SVC_REMOVE);
+        Add(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS, 44, 552, 320, 22, IDC_SVC_STATUS);
+        Add(L"BUTTON", L"Install service", BS_PUSHBUTTON | WS_TABSTOP, 44, 580, 150, 28, IDC_SVC_BTN);
+        Add(L"BUTTON", L"Uninstall service", BS_PUSHBUTTON | WS_TABSTOP, 204, 580, 160, 28, IDC_SVC_REMOVE);
+        Add(L"BUTTON", L"Consent for UAC/sign-in viewing (admin, WIP)", BS_AUTOCHECKBOX | WS_TABSTOP, 44, 520, 360, 24, IDC_SECURE);
 
         // ---- right card: connect
         Add(L"STATIC", L"REMOTE PC", SS_LEFT, 436, 108, 200, 16, IDC_LBL_RADDR + 100);
@@ -242,6 +244,7 @@ private:
         adminPref_ = cfg_->AdminMode();
         CheckDlgButton(hwnd_, IDC_AUTOSTART, IsAutostartEnabled() ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hwnd_, IDC_ADMIN, adminPref_ ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hwnd_, IDC_SECURE, SecureDesktopAllowed() ? BST_CHECKED : BST_UNCHECKED);
         if (IsElevated()) SetWindowTextW(hwnd_, L"RemoteDisplay (Administrator)");
         UpdateAdminUi();
         taskbarCreated_ = RegisterWindowMessageW(L"TaskbarCreated");  // Explorer restarted: re-add the icon
@@ -391,6 +394,7 @@ private:
         SetText(IDC_SVC_STATUS, L"Waiting for administrator approval...");
         EnableWindow(Ctrl(IDC_SVC_BTN), FALSE);
         EnableWindow(Ctrl(IDC_SVC_REMOVE), FALSE);
+        EnableWindow(Ctrl(IDC_SECURE), FALSE);
         svcThread_ = std::thread([this, args] {
             const int rc = RunElevated(hwnd_, args);
             PostMessage(hwnd_, kMsgSvcDone, WPARAM(rc), 0);
@@ -467,6 +471,18 @@ private:
                     CheckDlgButton(hwnd_, IDC_AUTOSTART, BST_UNCHECKED);
                     fail();
                 }
+                break;
+            case Elev::SecureOn:
+                if (ok) {
+                    Message(L"Consent recorded. Every use of the UAC / sign-in screen is written to the audit log.", kGreen);
+                } else {
+                    CheckDlgButton(hwnd_, IDC_SECURE, BST_UNCHECKED);
+                    fail();
+                }
+                break;
+            case Elev::SecureOff:
+                if (ok) Message(L"Consent withdrawn.", kMuted);
+                else { CheckDlgButton(hwnd_, IDC_SECURE, BST_CHECKED); fail(); }
                 break;
             case Elev::TaskOff:
                 if (ok) Message(L"Will no longer start with Windows.", kMuted);
@@ -563,6 +579,7 @@ private:
             const bool installed = svcState_ != SvcState::NotInstalled;
             EnableWindow(Ctrl(IDC_SVC_BTN), !installed);
             EnableWindow(Ctrl(IDC_SVC_REMOVE), installed);
+            EnableWindow(Ctrl(IDC_SECURE), !svcBusy_);
         }
     }
 
@@ -755,14 +772,14 @@ private:
         HBRUSH card = CreateSolidBrush(kCard);
         SelectObject(mem, pen);
         SelectObject(mem, card);
-        RoundRect(mem, S(24), S(96), S(404), S(592), S(14), S(14));
-        RoundRect(mem, S(416), S(96), S(796), S(592), S(14), S(14));
+        RoundRect(mem, S(24), S(96), S(404), S(620), S(14), S(14));
+        RoundRect(mem, S(416), S(96), S(796), S(620), S(14), S(14));
         DeleteObject(pen);
         DeleteObject(card);
 
         SetTextColor(mem, kMuted);
         SelectObject(mem, fontSmall_);
-        TextOutW(mem, S(26), S(604), L"AES-128-GCM encrypted. Connections need your pairing key.", 56);
+        TextOutW(mem, S(26), S(632), L"AES-128-GCM encrypted. Connections need your pairing key.", 56);
 
         BitBlt(dc, 0, 0, cr.right, cr.bottom, mem, 0, 0, SRCCOPY);
         SelectObject(mem, old);
@@ -930,6 +947,15 @@ private:
                         const bool autostart = IsDlgButtonChecked(h, IDC_AUTOSTART) == BST_CHECKED;
                         const wchar_t* verbs = on ? (autostart ? L"worker-on,task-on" : L"worker-on") : L"worker-off,task-off";
                         ElevatedAction(std::wstring(L"--admin-ctl ") + verbs + UserArg(), on ? Elev::AdminOn : Elev::AdminOff);
+                        break;
+                    }
+                    case IDC_SECURE: {
+                        // Changing the consent needs administrator rights (UAC), so a connected viewer cannot
+                        // switch it on. Declining the prompt puts the checkbox back.
+                        const bool on = IsDlgButtonChecked(h, IDC_SECURE) == BST_CHECKED;
+                        if (svcBusy_) { CheckDlgButton(h, IDC_SECURE, on ? BST_UNCHECKED : BST_CHECKED); break; }
+                        ElevatedAction(std::wstring(L"--admin-ctl ") + (on ? L"secure-on" : L"secure-off") + UserArg(),
+                                       on ? Elev::SecureOn : Elev::SecureOff);
                         break;
                     }
                     case IDC_ADMIN_STATE:

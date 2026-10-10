@@ -8,6 +8,7 @@
 #include <thread>
 
 #include "common.h"
+#include "secure.h"
 #include "host.h"
 #include "shared.h"
 
@@ -55,8 +56,16 @@ inline int RunWorker() {
         std::atomic<bool> prompting{false};
         PromptHandle promptHandle;
         int lastState = -1;
+        bool wasSecure = false;
         while (!done) {
             status.Publish(st);
+            // Opt-in secure-desktop audit: record every time the UAC prompt / sign-in screen takes over.
+            const bool secure = OnSecureDesktop();
+            if (secure != wasSecure) {
+                wasSecure = secure;
+                Audit(secure ? "secure-desktop-entered" : "secure-desktop-left",
+                      SecureDesktopAllowed() ? "policy=allowed" : "policy=not-allowed");
+            }
             if (status.KickRequested()) st.kick = true;
             if (status.RestartRequested()) {  // settings changed (key, approval, admin mode): the service relaunches us
                 Log(log, "restart requested by the app");
