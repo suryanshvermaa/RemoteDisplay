@@ -17,7 +17,9 @@
 #include <cstdio>
 #include <cstring>
 #include <utility>
+#include <string>
 #include <vector>
+#include <windows.h>
 
 #include "protocol.h"
 
@@ -39,6 +41,12 @@ public:
     // Re-creates the device at a new size. Anything built on the old device (the encoder) must follow:
     // Generation() changes so callers can tell.
     bool ResizeTo(UINT w, UINT h) { return BuildDevice(w, h); }
+
+    // Which display to capture: "" = the first one, "virtual" = the RemoteDisplay virtual monitor,
+    // or a GDI device name such as \\.\DISPLAY2. Takes effect at the next device build.
+    void SelectOutput(const std::wstring& want) { want_ = want; }
+    // The GDI device name of the output being captured (e.g. \\.\DISPLAY22).
+    const std::wstring& outputName() const { return outputName_; }
 
     bool HasDevice() const { return dev_ != nullptr; }
     uint32_t Generation() const { return generation_; }
@@ -148,6 +156,19 @@ private:
         ComPtr<ID3D11VideoProcessorInputView> inView;
     };
 
+    bool OutputMatches(IDXGIOutput* o) const {
+        DXGI_OUTPUT_DESC d = {};
+        if (FAILED(o->GetDesc(&d)) || !d.AttachedToDesktop) return false;
+        if (want_ != L"virtual") return _wcsicmp(d.DeviceName, want_.c_str()) == 0;
+        // The virtual monitor's EDID gives it the monitor ID RDV0001.
+        DISPLAY_DEVICEW mon = {sizeof(mon)};
+        for (DWORD k = 0; EnumDisplayDevicesW(d.DeviceName, k, &mon, 0); ++k) {
+            if (wcsstr(mon.DeviceID, L"RDV0001")) return true;
+            mon.cb = sizeof(mon);
+        }
+        return false;
+    }
+
     // Creates a device on the output's adapter and a pipeline at w x h (0 = desktop size). On success
     // everything is replaced at once; any duplication on the old device is dropped.
     bool BuildDevice(UINT forceW, UINT forceH) {
@@ -155,15 +176,35 @@ private:
         if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return false;
         ComPtr<IDXGIAdapter1> adapter;
         ComPtr<IDXGIOutput> output;
-        // First adapter that actually owns an attached output (matters on hybrid-GPU laptops).
-        for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
-            if (SUCCEEDED(adapter->EnumOutputs(0, &output))) break;
-            adapter.Reset();
+        // The requested output (see SelectOutput), else the first attached output on any adapter.
+        ComPtr<IDXGIAdapter1> firstAdapter;
+        ComPtr<IDXGIOutput> firstOutput;
+        ComPtr<IDXGIAdapter1> a;
+        for (UINT i = 0; factory->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND && !output; ++i) {
+            ComPtr<IDXGIOutput> o;
+            for (UINT j = 0; a->EnumOutputs(j, &o) != DXGI_ERROR_NOT_FOUND; ++j) {
+                if (!firstOutput) {
+                    firstAdapter = a;
+                    firstOutput = o;
+                }
+                if (!want_.empty() && OutputMatches(o.Get())) {
+                    adapter = a;
+                    output = o;
+                    break;
+                }
+                o.Reset();
+            }
+            a.Reset();
+        }
+        if (!output) {
+            adapter = firstAdapter;
+            output = firstOutput;
         }
         if (!adapter || !output) CAP_FAIL("no adapter with an attached output", 0);
         DXGI_OUTPUT_DESC od = {};
         output->GetDesc(&od);
         const RECT rect = od.DesktopCoordinates;
+        outputName_ = od.DeviceName;
 
         ComPtr<IDXGIOutput1> out1;
         if (FAILED(output.As(&out1))) return false;
@@ -339,6 +380,7 @@ private:
     ID3D11Texture2D* last_ = nullptr;
     RECT rect_ = {0, 0, 1920, 1080};
     uint32_t generation_ = 0;
+    std::wstring want_, outputName_;
     std::vector<uint8_t> cursorBlob_;
     uint32_t cursorId_ = 0;
     bool cursorChanged_ = false;

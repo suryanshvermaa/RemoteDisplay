@@ -36,6 +36,7 @@ inline int RunWorker() {
     hc.psk = cfg.HostKey();
     hc.requireApproval = cfg.RequireApproval();
     hc.allowControl = cfg.AllowControl();
+    hc.display = W(cfg.Display());
     ConfigTrust trust;
     hc.trust = &trust;
     SecureFeedReader secureFeed;  // the UAC / sign-in screen picture from the helper, if it runs

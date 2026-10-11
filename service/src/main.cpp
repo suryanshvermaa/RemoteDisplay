@@ -23,6 +23,10 @@ int main(int argc, char** argv) {
         else if (a == "--mbps") cfg.mbps = atoi(argv[i + 1]);
         else if (a == "--key") keyText = argv[i + 1];
         else if (a == "--control") cfg.allowControl = atoi(argv[i + 1]) != 0;  // 0 = view only
+        else if (a == "--display") {  // "virtual" or a device name such as \\.\DISPLAY2
+            const std::string v = argv[i + 1];
+            cfg.display.assign(v.begin(), v.end());
+        }
     }
     if (keyText.empty()) {
         rd::crypto::Random(cfg.psk.data(), cfg.psk.size());
