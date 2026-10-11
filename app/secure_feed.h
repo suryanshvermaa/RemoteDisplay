@@ -62,7 +62,10 @@ public:
     void Publish(const uint8_t* bgra, UINT w, UINT h, UINT pitch) {
         const size_t bytes = size_t(pitch) * h;
         if (!bgra || bytes == 0 || bytes > kSecureMaxBytes) return;
-        InterlockedIncrement(&hdr_->seq);  // odd: a reader that sees this must retry
+        // Take the last even value as the base. A previous helper killed mid-write can leave the counter
+        // odd; counting from that would invert the parity and freeze every reader.
+        const LONG base = hdr_->seq & ~1;
+        InterlockedExchange(&hdr_->seq, base + 1);  // odd: a reader that sees this must retry
         MemoryBarrier();
         hdr_->width = w;
         hdr_->height = h;
@@ -70,7 +73,7 @@ public:
         memcpy(Data(), bgra, bytes);
         MemoryBarrier();
         InterlockedIncrement(&hdr_->frameNo);
-        InterlockedIncrement(&hdr_->seq);  // even: consistent again
+        InterlockedExchange(&hdr_->seq, base + 2);  // even: consistent again
     }
 
 private:
@@ -106,6 +109,12 @@ public:
     ID3D11Texture2D* Upload(Capture& cap, bool needFrame) override {
         SecureFrameInfo info;
         if (!ReadLatest(buf_, info, needFrame)) return nullptr;
+        if (info.width != cap.bgraWidth() || info.height != cap.bgraHeight()) {
+            // The secure desktop has another size than our device: rebuild the device at that size.
+            // The host sees the generation change and rebuilds the encoder before the next frame.
+            cap.ResizeTo(info.width, info.height);
+            return nullptr;
+        }
         return cap.UploadBgra(buf_.data(), info.pitch, info.width, info.height);
     }
 

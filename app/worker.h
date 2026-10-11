@@ -40,6 +40,7 @@ inline int RunWorker() {
     hc.trust = &trust;
     SecureFeedReader secureFeed;  // the UAC / sign-in screen picture from the helper, if it runs
     hc.secure = &secureFeed;
+    hc.log = [log](const std::string& m) { Log(log, "%s", m.c_str()); };  // host diagnostics
     Log(log, "listening on UDP %d, approval %s, control %s", hc.port, hc.requireApproval ? "required" : "not required",
         hc.allowControl ? "allowed" : "view only");
 

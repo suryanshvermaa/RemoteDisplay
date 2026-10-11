@@ -1,6 +1,13 @@
 #pragma once
 // DXGI Desktop Duplication + GPU BGRA->NV12 conversion (D3D11 video processor).
 // Frames never touch system memory: capture -> NV12 texture -> hardware encoder.
+//
+// Three things are kept apart on purpose:
+//  - the device and the conversion pipeline (they must stay alive for the encoder),
+//  - the desktop duplication (it fails while the UAC prompt or lock screen is up, and is re-created after),
+//  - the pictures handed in from the secure-desktop helper (UploadBgra), which need only the device.
+// Everything is built into temporaries and committed only on success, so a failed attempt never leaves
+// the object half-built.
 #include <d3d11.h>
 #include <d3d11_1.h>
 #include <dxgi1_2.h>
@@ -9,6 +16,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 #include "protocol.h"
@@ -19,52 +27,38 @@ using Microsoft::WRL::ComPtr;
 
 class Capture {
 public:
+    // Makes sure a device exists and starts desktop duplication on it. True when Grab() can be used.
+    // False does not mean the device is gone: HasDevice() stays true and UploadBgra() still works.
     bool Init() {
-        ComPtr<IDXGIFactory1> factory;
-        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return false;
-        ComPtr<IDXGIAdapter1> adapter;
-        ComPtr<IDXGIOutput> output;
-        // First adapter that actually owns an attached output (matters on hybrid-GPU laptops).
-        for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
-            if (SUCCEEDED(adapter->EnumOutputs(0, &output))) break;
-            adapter.Reset();
-        }
-        if (!adapter || !output) CAP_FAIL("no adapter with an attached output", 0);
-        DXGI_OUTPUT_DESC od = {};
-        output->GetDesc(&od);
-        rect_ = od.DesktopCoordinates;
-
-        dev_.Reset();
-        ctx_.Reset();
-        staging_.Reset();
-        if (HRESULT e = D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
-                                         D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                                         nullptr, 0, D3D11_SDK_VERSION, &dev_, nullptr, &ctx_); FAILED(e))
-            CAP_FAIL("D3D11CreateDevice", e);
-        ComPtr<ID3D10Multithread> mt;
-        if (SUCCEEDED(dev_.As(&mt))) mt->SetMultithreadProtected(TRUE);
-
-        ComPtr<IDXGIOutput1> output1;
-        if (FAILED(output.As(&output1))) return false;
-        dupl_.Reset();
-        if (HRESULT e = output1->DuplicateOutput(dev_.Get(), &dupl_); FAILED(e)) CAP_FAIL("DuplicateOutput", e);
-        DXGI_OUTDUPL_DESC dd;
-        dupl_->GetDesc(&dd);
-        width_ = dd.ModeDesc.Width & ~1u;  // NV12 needs even dimensions
-        height_ = dd.ModeDesc.Height & ~1u;
-        if (!InitConverter()) CAP_FAIL("video processor setup", 0);
-        return true;
+        if (!dev_ && !BuildDevice(0, 0)) return false;
+        if (StartDuplication()) return true;
+        if (dev_ && dev_->GetDeviceRemovedReason() != S_OK) return BuildDevice(0, 0) && StartDuplication();  // GPU reset
+        return false;
     }
 
-    // Waits up to timeoutMs for a new desktop frame. Returns the NV12 texture, or nullptr on
-    // timeout (screen unchanged). Sets `lost` if duplication must be re-initialised.
+    // Re-creates the device at a new size. Anything built on the old device (the encoder) must follow:
+    // Generation() changes so callers can tell.
+    bool ResizeTo(UINT w, UINT h) { return BuildDevice(w, h); }
+
+    bool HasDevice() const { return dev_ != nullptr; }
+    uint32_t Generation() const { return generation_; }
+
+    // Waits up to timeoutMs for a new desktop frame. Returns the NV12 texture, or nullptr on timeout
+    // (screen unchanged). Sets `lost` if duplication must be re-initialised.
     ID3D11Texture2D* Grab(UINT timeoutMs, bool& lost) {
         lost = false;
+        if (!dupl_) {  // no duplication right now (secure desktop up, or never started)
+            lost = true;
+            return nullptr;
+        }
         DXGI_OUTDUPL_FRAME_INFO info;
         ComPtr<IDXGIResource> res;
         HRESULT hr = dupl_->AcquireNextFrame(timeoutMs, &info, &res);
         if (hr == DXGI_ERROR_WAIT_TIMEOUT) return nullptr;
-        if (FAILED(hr)) { lost = true; return nullptr; }
+        if (FAILED(hr)) {
+            lost = true;
+            return nullptr;
+        }
 
         if (info.PointerShapeBufferSize > 0) ReadPointerShape(info.PointerShapeBufferSize);
         if (info.LastPresentTime.QuadPart == 0) {  // only the mouse pointer moved: no new picture
@@ -73,70 +67,55 @@ public:
         }
 
         ComPtr<ID3D11Texture2D> desktop;
-        res.As(&desktop);
-        ctx_->CopyResource(bgra_.Get(), desktop.Get());
+        D3D11_TEXTURE2D_DESC fd = {};
+        if (FAILED(res.As(&desktop))) {
+            dupl_->ReleaseFrame();
+            lost = true;
+            return nullptr;
+        }
+        desktop->GetDesc(&fd);
+        if (fd.Width != pipe_.bw || fd.Height != pipe_.bh) {  // mode changed; rebuild on the next Init()
+            dupl_->ReleaseFrame();
+            lost = true;
+            return nullptr;
+        }
+        ctx_->CopyResource(pipe_.bgra.Get(), desktop.Get());
         dupl_->ReleaseFrame();
         return Convert(lost);
     }
 
     // Uploads a BGRA picture from system memory (the secure-desktop helper's copy) and converts it the
-    // same way as a desktop frame. nullptr if the size differs from this output.
+    // same way as a desktop frame. nullptr if there is no device or the size differs from it.
     ID3D11Texture2D* UploadBgra(const uint8_t* src, UINT srcPitch, UINT w, UINT h) {
-        if (w != bgraW_ || h != bgraH_ || !src) return nullptr;
-        ctx_->UpdateSubresource(bgra_.Get(), 0, nullptr, src, srcPitch, 0);
+        if (!pipe_.bgra || !src || w != pipe_.bw || h != pipe_.bh) return nullptr;
+        ctx_->UpdateSubresource(pipe_.bgra.Get(), 0, nullptr, src, srcPitch, 0);
         bool lost = false;
         return Convert(lost);
     }
 
-    // Copies the picture last written to bgra_ into system memory (secure-desktop helper only).
+    // Copies the picture last written to the BGRA texture into system memory (secure-desktop helper only).
     bool ReadBgra(std::vector<uint8_t>& out, UINT& pitch) {
+        if (!pipe_.bgra) return false;
         if (!staging_) {
             D3D11_TEXTURE2D_DESC td = {};
-            bgra_->GetDesc(&td);
+            pipe_.bgra->GetDesc(&td);
             td.Usage = D3D11_USAGE_STAGING;
             td.BindFlags = 0;
             td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
             td.MiscFlags = 0;
             if (FAILED(dev_->CreateTexture2D(&td, nullptr, &staging_))) return false;
         }
-        ctx_->CopyResource(staging_.Get(), bgra_.Get());
+        ctx_->CopyResource(staging_.Get(), pipe_.bgra.Get());
         D3D11_MAPPED_SUBRESOURCE m = {};
         if (FAILED(ctx_->Map(staging_.Get(), 0, D3D11_MAP_READ, 0, &m))) return false;
         pitch = m.RowPitch;
-        out.resize(size_t(pitch) * bgraH_);
-        for (UINT y = 0; y < bgraH_; ++y)
+        out.resize(size_t(pitch) * pipe_.bh);
+        for (UINT y = 0; y < pipe_.bh; ++y)
             memcpy(out.data() + size_t(y) * pitch, static_cast<const uint8_t*>(m.pData) + size_t(y) * m.RowPitch, pitch);
         ctx_->Unmap(staging_.Get(), 0);
         return true;
     }
 
-    UINT bgraWidth() const { return bgraW_; }
-    UINT bgraHeight() const { return bgraH_; }
-
-private:
-    // BGRA (bgra_) -> NV12 through the video processor, into the next ring texture.
-    ID3D11Texture2D* Convert(bool& lost) {
-        ID3D11Texture2D* out = nv12Ring_[ringPos_].Get();
-        ringPos_ = (ringPos_ + 1) % nv12Ring_.size();
-        D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovd = {};
-        ovd.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
-        ComPtr<ID3D11VideoProcessorOutputView> ov;
-        if (FAILED(vdev_->CreateVideoProcessorOutputView(out, venum_.Get(), &ovd, &ov))) {
-            lost = true;
-            return nullptr;
-        }
-        D3D11_VIDEO_PROCESSOR_STREAM st = {};
-        st.Enable = TRUE;
-        st.pInputSurface = inView_.Get();
-        if (FAILED(vctx_->VideoProcessorBlt(vp_.Get(), ov.Get(), 0, 1, &st))) {
-            lost = true;
-            return nullptr;
-        }
-        last_ = out;
-        return out;
-    }
-
-public:
     ID3D11Texture2D* Last() const { return last_; }
     const RECT& desktopRect() const { return rect_; }
 
@@ -150,10 +129,168 @@ public:
     const std::vector<uint8_t>& CursorBlob() const { return cursorBlob_; }  // CursorBlobHeader + BGRA
     uint32_t CursorId() const { return cursorId_; }
     ID3D11Device* device() const { return dev_.Get(); }
-    UINT width() const { return width_; }
-    UINT height() const { return height_; }
+    UINT width() const { return pipe_.ow; }     // NV12 (encoder) size, even
+    UINT height() const { return pipe_.oh; }
+    UINT bgraWidth() const { return pipe_.bw; }  // desktop size
+    UINT bgraHeight() const { return pipe_.bh; }
 
 private:
+    // The textures and video processor that turn a BGRA picture into NV12. Built whole or not at all.
+    struct Pipe {
+        ComPtr<ID3D11Texture2D> bgra;               // desktop-sized BGRA picture
+        UINT bw = 0, bh = 0;                        // BGRA size
+        UINT ow = 0, oh = 0;                        // NV12 size (even)
+        std::vector<ComPtr<ID3D11Texture2D>> ring;  // NV12 output ring
+        ComPtr<ID3D11VideoDevice> vdev;
+        ComPtr<ID3D11VideoContext> vctx;
+        ComPtr<ID3D11VideoProcessorEnumerator> venum;
+        ComPtr<ID3D11VideoProcessor> vp;
+        ComPtr<ID3D11VideoProcessorInputView> inView;
+    };
+
+    // Creates a device on the output's adapter and a pipeline at w x h (0 = desktop size). On success
+    // everything is replaced at once; any duplication on the old device is dropped.
+    bool BuildDevice(UINT forceW, UINT forceH) {
+        ComPtr<IDXGIFactory1> factory;
+        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return false;
+        ComPtr<IDXGIAdapter1> adapter;
+        ComPtr<IDXGIOutput> output;
+        // First adapter that actually owns an attached output (matters on hybrid-GPU laptops).
+        for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
+            if (SUCCEEDED(adapter->EnumOutputs(0, &output))) break;
+            adapter.Reset();
+        }
+        if (!adapter || !output) CAP_FAIL("no adapter with an attached output", 0);
+        DXGI_OUTPUT_DESC od = {};
+        output->GetDesc(&od);
+        const RECT rect = od.DesktopCoordinates;
+
+        ComPtr<IDXGIOutput1> out1;
+        if (FAILED(output.As(&out1))) return false;
+        ComPtr<ID3D11Device> dev;
+        ComPtr<ID3D11DeviceContext> ctx;
+        if (HRESULT e = D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+                                         D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                                         nullptr, 0, D3D11_SDK_VERSION, &dev, nullptr, &ctx); FAILED(e))
+            CAP_FAIL("D3D11CreateDevice", e);
+        ComPtr<ID3D10Multithread> mt;
+        if (SUCCEEDED(dev.As(&mt))) mt->SetMultithreadProtected(TRUE);
+
+        const UINT w = forceW ? forceW : UINT(rect.right - rect.left);
+        const UINT h = forceH ? forceH : UINT(rect.bottom - rect.top);
+        Pipe p;
+        if (!MakePipe(dev.Get(), ctx.Get(), w, h, p)) return false;
+
+        // Commit. Nothing above touched the object, so a failure leaves the previous state intact.
+        dupl_.Reset();  // a duplication belongs to the device it was made on
+        dev_ = dev;
+        ctx_ = ctx;
+        output1_ = out1;
+        rect_ = rect;
+        pipe_ = std::move(p);
+        staging_.Reset();
+        ringPos_ = 0;
+        last_ = nullptr;
+        ++generation_;
+        return true;
+    }
+
+    // Starts duplication on the current device. Returns false, leaving the device alone, if it cannot
+    // (for example while the secure desktop is up). Rebuilds the device if the mode changed.
+    bool StartDuplication() {
+        dupl_.Reset();
+        if (!dev_ || !output1_) return false;
+        ComPtr<IDXGIOutputDuplication> d;
+        if (FAILED(output1_->DuplicateOutput(dev_.Get(), &d))) return false;
+        DXGI_OUTDUPL_DESC dd = {};
+        d->GetDesc(&dd);
+        if (dd.ModeDesc.Width != pipe_.bw || dd.ModeDesc.Height != pipe_.bh) {  // resolution changed
+            d.Reset();
+            if (!BuildDevice(dd.ModeDesc.Width, dd.ModeDesc.Height)) return false;
+            if (FAILED(output1_->DuplicateOutput(dev_.Get(), &d))) return false;
+        }
+        dupl_ = d;
+        return true;
+    }
+
+    bool MakePipe(ID3D11Device* dev, ID3D11DeviceContext* ctx, UINT w, UINT h, Pipe& p) {
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width = w;
+        td.Height = h;
+        td.MipLevels = td.ArraySize = 1;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;  // RENDER_TARGET: video processor input view
+        if (HRESULT e = dev->CreateTexture2D(&td, nullptr, &p.bgra); FAILED(e)) CAP_FAIL("create BGRA texture", e);
+        p.bw = w;
+        p.bh = h;
+        p.ow = w & ~1u;  // NV12 needs even dimensions
+        p.oh = h & ~1u;
+
+        td.Width = p.ow;
+        td.Height = p.oh;
+        td.Format = DXGI_FORMAT_NV12;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET;
+        p.ring.assign(8, nullptr);
+        for (auto& t : p.ring)
+            if (HRESULT e = dev->CreateTexture2D(&td, nullptr, &t); FAILED(e)) CAP_FAIL("create NV12 texture", e);
+
+        if (HRESULT e = dev->QueryInterface(IID_PPV_ARGS(&p.vdev)); FAILED(e)) CAP_FAIL("ID3D11VideoDevice", e);
+        if (HRESULT e = ctx->QueryInterface(IID_PPV_ARGS(&p.vctx)); FAILED(e)) CAP_FAIL("ID3D11VideoContext", e);
+
+        D3D11_VIDEO_PROCESSOR_CONTENT_DESC cd = {};
+        cd.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+        cd.InputWidth = w;
+        cd.InputHeight = h;
+        cd.OutputWidth = p.ow;
+        cd.OutputHeight = p.oh;
+        cd.Usage = D3D11_VIDEO_USAGE_OPTIMAL_SPEED;
+        if (HRESULT e = p.vdev->CreateVideoProcessorEnumerator(&cd, &p.venum); FAILED(e)) CAP_FAIL("VP enumerator", e);
+        if (HRESULT e = p.vdev->CreateVideoProcessor(p.venum.Get(), 0, &p.vp); FAILED(e)) CAP_FAIL("create VP", e);
+
+        // RGB full-range in -> BT.709 limited-range YCbCr out.
+        D3D11_VIDEO_PROCESSOR_COLOR_SPACE in = {};
+        in.RGB_Range = 0;
+        D3D11_VIDEO_PROCESSOR_COLOR_SPACE out = {};
+        out.YCbCr_Matrix = 1;
+        out.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
+        p.vctx->VideoProcessorSetStreamColorSpace(p.vp.Get(), 0, &in);
+        p.vctx->VideoProcessorSetOutputColorSpace(p.vp.Get(), &out);
+        RECT r = {0, 0, LONG(p.ow), LONG(p.oh)};
+        p.vctx->VideoProcessorSetStreamSourceRect(p.vp.Get(), 0, TRUE, &r);
+        p.vctx->VideoProcessorSetStreamDestRect(p.vp.Get(), 0, TRUE, &r);
+
+        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd = {};
+        ivd.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+        if (HRESULT e = p.vdev->CreateVideoProcessorInputView(p.bgra.Get(), p.venum.Get(), &ivd, &p.inView); FAILED(e))
+            CAP_FAIL("VP input view", e);
+        return true;
+    }
+
+    // BGRA (pipe_.bgra) -> NV12 through the video processor, into the next ring texture.
+    ID3D11Texture2D* Convert(bool& lost) {
+        ID3D11Texture2D* out = pipe_.ring[ringPos_].Get();
+        ringPos_ = (ringPos_ + 1) % pipe_.ring.size();
+        D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovd = {};
+        ovd.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+        ComPtr<ID3D11VideoProcessorOutputView> ov;
+        if (FAILED(pipe_.vdev->CreateVideoProcessorOutputView(out, pipe_.venum.Get(), &ovd, &ov))) {
+            lost = true;
+            return nullptr;
+        }
+        D3D11_VIDEO_PROCESSOR_STREAM st = {};
+        st.Enable = TRUE;
+        st.pInputSurface = pipe_.inView.Get();
+        if (FAILED(pipe_.vctx->VideoProcessorBlt(pipe_.vp.Get(), ov.Get(), 0, 1, &st))) {
+            lost = true;
+            return nullptr;
+        }
+        last_ = out;
+        return out;
+    }
+
+    // The pointer is not part of the captured picture; its shape is tracked separately.
     void ReadPointerShape(UINT size) {
         std::vector<uint8_t> buf(size);
         UINT required = 0;
@@ -192,81 +329,16 @@ private:
         cursorChanged_ = true;
     }
 
-    bool InitConverter() {
-        D3D11_TEXTURE2D_DESC td = {};
-        td.Width = width_;
-        td.Height = height_;
-        td.MipLevels = td.ArraySize = 1;
-        td.SampleDesc.Count = 1;
-        td.Usage = D3D11_USAGE_DEFAULT;
-
-        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-        // Desktop may be larger than the even-cropped size; CopyResource needs equal sizes.
-        DXGI_OUTDUPL_DESC dd;
-        dupl_->GetDesc(&dd);
-        td.Width = dd.ModeDesc.Width;
-        td.Height = dd.ModeDesc.Height;
-        if (HRESULT e = dev_->CreateTexture2D(&td, nullptr, &bgra_); FAILED(e)) CAP_FAIL("create BGRA texture", e);
-        bgraW_ = td.Width;
-        bgraH_ = td.Height;
-
-        td.Width = width_;
-        td.Height = height_;
-        td.Format = DXGI_FORMAT_NV12;
-        td.BindFlags = D3D11_BIND_RENDER_TARGET;
-        nv12Ring_.assign(8, nullptr);
-        for (auto& t : nv12Ring_)
-            if (HRESULT e = dev_->CreateTexture2D(&td, nullptr, &t); FAILED(e)) CAP_FAIL("create NV12 texture", e);
-
-        if (HRESULT e = dev_.As(&vdev_); FAILED(e)) CAP_FAIL("ID3D11VideoDevice", e);
-        ComPtr<ID3D11DeviceContext> c;
-        dev_->GetImmediateContext(&c);
-        if (HRESULT e = c.As(&vctx_); FAILED(e)) CAP_FAIL("ID3D11VideoContext", e);
-
-        D3D11_VIDEO_PROCESSOR_CONTENT_DESC cd = {};
-        cd.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
-        cd.InputWidth = dd.ModeDesc.Width;
-        cd.InputHeight = dd.ModeDesc.Height;
-        cd.OutputWidth = width_;
-        cd.OutputHeight = height_;
-        cd.Usage = D3D11_VIDEO_USAGE_OPTIMAL_SPEED;
-        if (HRESULT e = vdev_->CreateVideoProcessorEnumerator(&cd, &venum_); FAILED(e)) CAP_FAIL("VP enumerator", e);
-        if (HRESULT e = vdev_->CreateVideoProcessor(venum_.Get(), 0, &vp_); FAILED(e)) CAP_FAIL("create VP", e);
-
-        // RGB full-range in -> BT.709 limited-range YCbCr out.
-        D3D11_VIDEO_PROCESSOR_COLOR_SPACE in = {};
-        in.RGB_Range = 0;
-        D3D11_VIDEO_PROCESSOR_COLOR_SPACE out = {};
-        out.YCbCr_Matrix = 1;
-        out.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
-        vctx_->VideoProcessorSetStreamColorSpace(vp_.Get(), 0, &in);
-        vctx_->VideoProcessorSetOutputColorSpace(vp_.Get(), &out);
-        RECT r = {0, 0, LONG(width_), LONG(height_)};
-        vctx_->VideoProcessorSetStreamSourceRect(vp_.Get(), 0, TRUE, &r);
-        vctx_->VideoProcessorSetStreamDestRect(vp_.Get(), 0, TRUE, &r);
-
-        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd = {};
-        ivd.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
-        if (HRESULT e = vdev_->CreateVideoProcessorInputView(bgra_.Get(), venum_.Get(), &ivd, &inView_); FAILED(e)) CAP_FAIL("VP input view", e);
-        return true;
-    }
-
     ComPtr<ID3D11Device> dev_;
     ComPtr<ID3D11DeviceContext> ctx_;
+    ComPtr<IDXGIOutput1> output1_;
     ComPtr<IDXGIOutputDuplication> dupl_;
-    ComPtr<ID3D11Texture2D> bgra_, staging_;
-    UINT bgraW_ = 0, bgraH_ = 0;
-    std::vector<ComPtr<ID3D11Texture2D>> nv12Ring_;
+    ComPtr<ID3D11Texture2D> staging_;
+    Pipe pipe_;
     size_t ringPos_ = 0;
     ID3D11Texture2D* last_ = nullptr;
-    ComPtr<ID3D11VideoDevice> vdev_;
-    ComPtr<ID3D11VideoContext> vctx_;
-    ComPtr<ID3D11VideoProcessorEnumerator> venum_;
-    ComPtr<ID3D11VideoProcessor> vp_;
-    ComPtr<ID3D11VideoProcessorInputView> inView_;
-    UINT width_ = 0, height_ = 0;
     RECT rect_ = {0, 0, 1920, 1080};
+    uint32_t generation_ = 0;
     std::vector<uint8_t> cursorBlob_;
     uint32_t cursorId_ = 0;
     bool cursorChanged_ = false;

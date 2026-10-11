@@ -313,7 +313,7 @@ private:
                 Log(log_, "secure-desktop helper exited (code %lu); restarting", code);
                 KillHelper();
                 helperStart_ = GetTickCount64();
-                helperBackoff_ = 5000;
+                helperBackoff_ = 2000;
             }
         }
         if (want && !helper_ && GetTickCount64() - helperStart_ >= helperBackoff_) LaunchHelper(sid);

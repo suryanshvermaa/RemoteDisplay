@@ -36,9 +36,16 @@ works, but the viewer window is on the desktop that gets locked, so the second P
 
 ## Logs
 
-- `%ProgramData%\RemoteDisplay\audit.log` should show `secure-desktop-entered` and
-  `secure-desktop-left` for Tests A and B, and `secure-desktop-policy allowed=0` for Test C's change.
-- `%ProgramData%\RemoteDisplay\secure-helper.log` shows when the helper starts and which desktop is
-  the input desktop.
+Three files in `%ProgramData%\RemoteDisplay\`:
 
-Please send back: which of A, B and C passed, and the last 20 lines of both logs if anything did not.
+- `audit.log`: should show `secure-desktop-entered` and `secure-desktop-left` for each lock or UAC
+  prompt, and `secure-desktop-policy allowed=0` for Test C's change.
+- `secure-helper.log`: should show `input desktop is now 'Winlogon'` when the lock screen or UAC prompt
+  appears, then `first picture from 'Winlogon': WxH`, then `input desktop is now 'Default'` afterwards.
+  Any `OpenInputDesktop failed` or `SetThreadDesktop ... failed` line means the helper could not follow
+  the secure desktop, and the error number is the important part.
+- `service.log`: should show `secure picture: N new frames in 10 s` while the secure screen is up, and
+  `screen duplication unavailable` / `screen duplication restored` around it.
+
+Please send back: which of A, B and C passed, and the last 40 lines of all three logs if anything did
+not. Include the time you did each test, so the lines can be matched up.

@@ -10,6 +10,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -51,6 +52,7 @@ struct HostConfig {
     bool allowControl = true;     // accept mouse/keyboard input from the (approved) viewer
     TrustStore* trust = nullptr;  // devices that skip the approval prompt; may be null
     SecureSource* secure = nullptr;  // UAC / sign-in screen frames from the helper; may be null
+    std::function<void(const std::string&)> log;  // optional diagnostics (the app writes them to its log)
 };
 
 struct HostStatus {
@@ -188,12 +190,41 @@ inline void RunHost(const HostConfig& cfg, std::atomic<bool>& stop, HostStatus& 
     Capture cap;
     Encoder enc;
     InputInjector inject;
-    auto initPipeline = [&]() {
-        if (!cap.Init()) return false;
-        inject.SetDesktopRect(cap.desktopRect());
-        return enc.Init(cap.device(), cap.width(), cap.height(), cfg.fps, cfg.mbps * 1'000'000);
+    bool forceKey = true;
+    uint32_t encGen = ~0u;   // capture device generation the encoder was built for
+    bool encReady = false;
+    bool dupDown = false;    // duplication is currently unavailable (logged once per outage)
+    auto note = [&](const std::string& m) {
+        if (cfg.log) cfg.log(m);
     };
-    if (!initPipeline()) {
+    // The encoder follows the capture device: rebuilt whenever the device is (new GPU, new mode).
+    auto followDevice = [&]() {
+        if (cap.Generation() == encGen) return encReady;
+        encGen = cap.Generation();
+        encReady = false;
+        if (cap.HasDevice()) {
+            encReady = enc.Init(cap.device(), cap.width(), cap.height(), cfg.fps, cfg.mbps * 1'000'000);
+            inject.SetDesktopRect(cap.desktopRect());
+            forceKey = true;
+            note(encReady ? "encoder ready " + std::to_string(cap.width()) + "x" + std::to_string(cap.height())
+                          : std::string("encoder setup failed"));
+        }
+        return encReady;
+    };
+    // Duplication may be unavailable (secure desktop up); the device is kept either way.
+    auto refresh = [&]() {
+        const bool dup = cap.Init();
+        if (!dup && !dupDown) {
+            dupDown = true;
+            note("screen duplication unavailable; retrying (secure desktop or mode change)");
+        } else if (dup && dupDown) {
+            dupDown = false;
+            note("screen duplication restored");
+        }
+        return dup && followDevice();
+    };
+    cap.Init();  // duplication may be unavailable at start (secure desktop up); the device still works
+    if (!followDevice()) {
         st.SetError("Screen capture or hardware H.264 encoder is unavailable on this PC");
         st.state = HostStatus::Failed;
         return;
@@ -203,7 +234,7 @@ inline void RunHost(const HostConfig& cfg, std::atomic<bool>& stop, HostStatus& 
     rd::Session active, pending;
     uint8_t cachedHs1[rd::kHs1Len] = {};
     uint8_t cachedHs2[sizeof(rd::WireHeader) + rd::kHs2Len] = {};
-    bool forceKey = true;
+    uint64_t secureFrames = 0, secureStatStart = 0;  // diagnostics for the secure-desktop picture
     uint32_t frameId = 0;
     std::vector<uint8_t> packet;
     uint64_t statStart = NowUs(), statBytes = 0, statFrames = 0, lastHs = 0, blockUntil = 0;
@@ -402,12 +433,23 @@ inline void RunHost(const HostConfig& cfg, std::atomic<bool>& stop, HostStatus& 
         bool lost = false;
         ID3D11Texture2D* tex = nullptr;
         if (secureNow) {
-            if (peer.valid) tex = cfg.secure->Upload(cap, forceKey);
-            else Sleep(50);  // nobody is watching yet: don't copy frames
+            if (!peer.valid) {
+                Sleep(50);  // nobody is watching yet: don't copy frames
+            } else if (followDevice()) {
+                tex = cfg.secure->Upload(cap, forceKey);
+                if (tex) ++secureFrames;
+            } else {
+                Sleep(100);
+            }
+            if (NowUs() - secureStatStart >= 10'000'000) {
+                if (secureStatStart) note("secure picture: " + std::to_string(secureFrames) + " new frames in 10 s");
+                secureFrames = 0;
+                secureStatStart = NowUs();
+            }
         } else {
             tex = cap.Grab(peer.valid ? 4 : 100, lost);
             if (lost) {
-                if (!initPipeline()) Sleep(500);
+                if (!refresh()) Sleep(300);  // no duplication yet (lock screen, mode change): retry shortly
                 forceKey = true;
                 continue;
             }

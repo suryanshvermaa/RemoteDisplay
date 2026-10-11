@@ -114,6 +114,59 @@ int main() {
         }
     }
 
+    // ---- 3) a helper killed mid-write must not freeze the picture for the next helper ----------
+    {
+        SecureFeedWriter w;
+        const wchar_t name[] = L"Local\\RemoteDisplaySecureFrameTestTorn";
+        CHECK(w.Create(name), "writer creates a picture for the torn-write test");
+        HANDLE m = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, name);
+        CHECK(m != nullptr, "the test can open the same picture directly");
+        if (m) {
+            void* v = MapViewOfFile(m, FILE_MAP_ALL_ACCESS, 0, 0, 0);
+            auto* hdr = static_cast<SecureHeader*>(v);
+            InterlockedIncrement(&hdr->seq);  // what a helper killed mid-write leaves behind: odd
+            const UINT W = 16, H = 8, P = W * 4;
+            std::vector<uint8_t> px(size_t(P) * H, 0x5A);
+            w.Publish(px.data(), W, H, P);  // the next helper publishes
+            SecureFeedReader r(name);
+            std::vector<uint8_t> buf;
+            SecureFrameInfo info;
+            CHECK(r.ReadLatest(buf, info, true), "a reader gets frames again after a killed writer");
+            CHECK(buf.size() == px.size() && buf[0] == 0x5A, "and the frame is the one published");
+            CHECK((hdr->seq & 1) == 0, "the counter is even (stable) again after the write");
+            UnmapViewOfFile(v);
+            CloseHandle(m);
+        }
+    }
+
+    // ---- 4) a capture that never started must not crash, and must not pretend to have a picture ----
+    {
+        Capture c;
+        bool lost = false;
+        CHECK(!c.HasDevice(), "a fresh capture has no device");
+        CHECK(c.Grab(0, lost) == nullptr && lost, "Grab on a capture that never started reports 'lost' and does not crash");
+        std::vector<uint8_t> px(16, 0), out;
+        UINT pitch = 0;
+        CHECK(c.UploadBgra(px.data(), 8, 2, 2) == nullptr, "UploadBgra without a device returns nothing");
+        CHECK(!c.ReadBgra(out, pitch), "ReadBgra without a device returns false");
+    }
+
+    // ---- 5) resizing the device keeps the picture path working at the new size -------------------
+    {
+        Capture c;
+        if (c.Init() || c.HasDevice()) {
+            const uint32_t gen = c.Generation();
+            CHECK(c.ResizeTo(640, 360), "the device can be rebuilt at a new size");
+            CHECK(c.Generation() != gen, "the generation changes, so the encoder is rebuilt");
+            CHECK(c.bgraWidth() == 640 && c.bgraHeight() == 360, "the pipeline now has the new size");
+            std::vector<uint8_t> px(size_t(640) * 4 * 360, 0x80);
+            CHECK(c.UploadBgra(px.data(), 640 * 4, 640, 360) != nullptr, "a 640x360 picture uploads at that size");
+            CHECK(c.UploadBgra(px.data(), 640 * 4, 1280, 720) == nullptr, "a picture of another size is refused");
+        } else {
+            printf("SKIP resize test: no device on this machine\n");
+        }
+    }
+
     printf(g_fail ? "%d FAILED\n" : "all secure-picture tests passed\n", g_fail);
     return g_fail ? 1 : 0;
 }
