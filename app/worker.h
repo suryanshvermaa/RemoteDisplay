@@ -12,6 +12,7 @@
 #include "secure_feed.h"
 #include "host.h"
 #include "shared.h"
+#include "virtual_monitor.h"
 
 namespace rdapp {
 
@@ -36,7 +37,11 @@ inline int RunWorker() {
     hc.psk = cfg.HostKey();
     hc.requireApproval = cfg.RequireApproval();
     hc.allowControl = cfg.AllowControl();
-    hc.display = W(cfg.Display());
+    // [host] display=virtual captures the virtual monitor (see driver\) instead of the first screen.
+    if (cfg.Get(L"host", L"display") == "virtual") {
+        hc.displayName = rdapp::FindVirtualMonitorDisplay();
+        Log(log, "capture target: %ls", hc.displayName.empty() ? L"virtual monitor not found (using the first screen)" : hc.displayName.c_str());
+    }
     ConfigTrust trust;
     hc.trust = &trust;
     SecureFeedReader secureFeed;  // the UAC / sign-in screen picture from the helper, if it runs

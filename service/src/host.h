@@ -53,7 +53,7 @@ struct HostConfig {
     TrustStore* trust = nullptr;  // devices that skip the approval prompt; may be null
     SecureSource* secure = nullptr;  // UAC / sign-in screen frames from the helper; may be null
     std::function<void(const std::string&)> log;  // optional diagnostics (the app writes them to its log)
-    std::wstring display;  // "" = first display, "virtual" = RemoteDisplay virtual monitor, or e.g. \.\DISPLAY2
+    std::wstring displayName;  // GDI name of the output to capture (e.g. \\.\DISPLAY22); empty = first output
 };
 
 struct HostStatus {
@@ -189,7 +189,7 @@ inline void RunHost(const HostConfig& cfg, std::atomic<bool>& stop, HostStatus& 
     }
 
     Capture cap;
-    cap.SelectOutput(cfg.display);
+    cap.SetOutputName(cfg.displayName);
     Encoder enc;
     InputInjector inject;
     bool forceKey = true;

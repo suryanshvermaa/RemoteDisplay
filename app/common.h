@@ -114,9 +114,6 @@ public:
     void SetHostKey(const std::array<uint8_t, rd::kKeyLen>& k) { Set(L"host", L"key", Protect(k.data(), k.size())); }
     bool RequireApproval() const { return Get(L"host", L"approve") != "0"; }
     bool AllowControl() const { return Get(L"host", L"control") != "0"; }
-    // Display to share: "" = first, "virtual" = the RemoteDisplay virtual monitor, or \.\DISPLAYn.
-    std::string Display() const { return Get(L"host", L"display"); }
-    void SetDisplay(const std::string& v) const { Set(L"host", L"display", v); }
     bool ShowTray() const { return Get(L"app", L"tray") != "0"; }  // default: show the tray icon
     bool AdminMode() const { return Get(L"app", L"admin") == "1"; }  // default: normal rights
     void SetAdminMode(bool v) const { Set(L"app", L"admin", v ? "1" : "0"); }

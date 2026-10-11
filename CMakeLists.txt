@@ -41,3 +41,7 @@ target_link_libraries(test-secure PRIVATE ${MF_LIBS} user32 gdi32 bcrypt crypt32
 # Virtual monitor EDID (plain C++, no WDK needed).
 add_executable(test-edid tests/test_edid.cpp driver/src/Edid.cpp)
 target_include_directories(test-edid PRIVATE driver/src)
+
+add_executable(test-display tests/test_display.cpp)
+target_include_directories(test-display PRIVATE service/include service/src client/src app)
+target_link_libraries(test-display PRIVATE ${MF_LIBS} user32 gdi32 bcrypt crypt32 iphlpapi comctl32 advapi32 wtsapi32 userenv shell32 secur32)

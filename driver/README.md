@@ -75,3 +75,18 @@ pnputil /delete-driver RemoteDisplayVirtual.inf /uninstall
 - Frames are released as soon as Windows presents them. Nothing renders them anywhere.
 - Test signing only. A shipped driver needs Microsoft attestation signing and the matching
   release checks; that is a separate step.
+
+## Use it for remote sessions
+
+The streaming app captures the first screen by default. To stream the virtual monitor instead, set
+this in `%APPDATA%\RemoteDisplay\config.ini`:
+
+```
+[host]
+display=virtual
+```
+
+With the virtual monitor extended (Win+P, Extend), the app finds the display whose monitor is named
+`RD Virtual` and captures it. If there is no such display, it falls back to the first screen and says
+so in the log. `build\Release\test-display.exe` checks the same path: it reports the display it found,
+the size, and the frames it gets.

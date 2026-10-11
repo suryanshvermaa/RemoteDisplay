@@ -10,6 +10,9 @@
 
 #include <cwchar>
 #include <string>
+#include <vector>
+
+#pragma comment(lib, "user32.lib")
 
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "newdev.lib")
@@ -118,6 +121,35 @@ inline bool RemoveVirtualMonitor(std::wstring& err) {
     }
     SetupDiDestroyDeviceInfoList(set);
     return ok;
+}
+
+// GDI name of the display showing the virtual monitor (e.g. \\.\DISPLAY22), or empty if there is none.
+// Matched on the monitor's name from Windows' display configuration ("... (RD Virtual)").
+inline std::wstring FindVirtualMonitorDisplay() {
+    UINT32 pathCount = 0, modeCount = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount) != ERROR_SUCCESS) return L"";
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount);
+    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &pathCount, paths.data(), &modeCount, modes.data(), nullptr) != ERROR_SUCCESS)
+        return L"";
+    for (UINT32 i = 0; i < pathCount; ++i) {
+        DISPLAYCONFIG_TARGET_DEVICE_NAME target = {};
+        target.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+        target.header.size = sizeof(target);
+        target.header.adapterId = paths[i].targetInfo.adapterId;
+        target.header.id = paths[i].targetInfo.id;
+        if (DisplayConfigGetDeviceInfo(&target.header) != ERROR_SUCCESS) continue;
+        if (wcsstr(target.monitorFriendlyDeviceName, L"RD Virtual") == nullptr) continue;
+
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME source = {};
+        source.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        source.header.size = sizeof(source);
+        source.header.adapterId = paths[i].sourceInfo.adapterId;
+        source.header.id = paths[i].sourceInfo.id;
+        if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS) continue;
+        return source.viewGdiDeviceName;
+    }
+    return L"";
 }
 
 }  // namespace rdapp
