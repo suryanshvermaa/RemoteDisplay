@@ -1,0 +1,58 @@
+; RemoteDisplay virtual monitor: an IddCx (indirect display) UMDF 2 driver.
+; The device is created by the app (see app\virtual_monitor.h) with the hardware ID below.
+; stampinf sets DriverVer at package time; see driver\build.ps1.
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = Display
+ClassGuid   = {4d36e968-e325-11ce-bfc1-08002be10318}
+Provider    = %ManufacturerName%
+CatalogFile = RemoteDisplayVirtual.cat
+DriverVer   = 01/01/2026,1.0.0.0
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 12
+UMDriverCopy   = 12,UMDF
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+RemoteDisplayVirtual.dll = 1
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTamd64
+
+[Standard.NTamd64]
+%DeviceName% = RemoteDisplayVirtual_Install, root\RemoteDisplayVirtual
+
+[RemoteDisplayVirtual_Install.NT]
+CopyFiles = UMDriverCopy
+
+[RemoteDisplayVirtual_Install.NT.Services]
+AddService = WUDFRd, 0x000001fa, WUDFRd_Service_Inst
+
+[WUDFRd_Service_Inst]
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %12%\WUDFRd.sys
+
+[RemoteDisplayVirtual_Install.NT.Wdf]
+UmdfService                 = RemoteDisplayVirtual, RemoteDisplayVirtual_Service
+UmdfServiceOrder            = RemoteDisplayVirtual
+UmdfKernelModeClientPolicy  = AllowKernelModeClients
+UmdfFileObjectPolicy        = AllowNullAndUnknownFileObjects
+UmdfFsContextUsePolicy      = CanUseFsContextUsePolicy
+UmdfMethodNeitherAction     = Copy
+UmdfExtensions              = IddCx0102
+
+[RemoteDisplayVirtual_Service]
+UmdfLibraryVersion = 2.33
+ServiceBinary      = %12%\UMDF\RemoteDisplayVirtual.dll
+
+[Strings]
+ManufacturerName = "RemoteDisplay"
+DiskName         = "RemoteDisplay Virtual Monitor Installation Disk"
+DeviceName       = "RemoteDisplay Virtual Monitor"

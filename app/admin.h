@@ -22,6 +22,7 @@
 #include "common.h"
 #include "ipc_security.h"
 #include "secure.h"
+#include "virtual_monitor.h"
 #include "service.h"
 
 #pragma comment(lib, "secur32.lib")
@@ -160,6 +161,17 @@ inline int AdminControl(const std::wstring& verbs, const std::wstring& user) {
         else if (v == L"task-off") ok = DeleteStartupTask();
         else if (v == L"secure-on") { ok = SetSecureDesktopAllowed(true); Audit("secure-desktop-policy", "allowed=1"); }
         else if (v == L"secure-off") { ok = SetSecureDesktopAllowed(false); Audit("secure-desktop-policy", "allowed=0"); }
+        else if (v.rfind(L"vm-add=", 0) == 0) {  // vm-add=<path to the driver package INF>
+            std::wstring e;
+            bool reboot = false;
+            ok = AddVirtualMonitor(v.substr(7), e, reboot);
+            if (!ok) Log(log, "vm-add: %ls", e.c_str());
+            if (ok && reboot) Log(log, "vm-add: a restart is needed before the virtual monitor appears");
+        } else if (v == L"vm-remove") {
+            std::wstring e;
+            ok = RemoveVirtualMonitor(e);
+            if (!ok) Log(log, "vm-remove: %ls", e.c_str());
+        }
         Log(log, "admin-ctl %ls: %s", v.c_str(), ok ? "ok" : "FAILED");
         if (!ok) rc = 20;
     }

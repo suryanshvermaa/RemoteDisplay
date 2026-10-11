@@ -1,0 +1,115 @@
+#pragma once
+// Adds and removes the RemoteDisplay virtual monitor (the IddCx driver in driver\).
+//
+// The monitor is a root-enumerated device with hardware ID root\RemoteDisplayVirtual, created with
+// SetupAPI, the same way devcon creates devices. Both calls change the system's devices, so they need
+// administrator rights and run only in the elevated helper (admin.h).
+#include <windows.h>
+#include <newdev.h>
+#include <setupapi.h>
+
+#include <cwchar>
+#include <string>
+
+#pragma comment(lib, "setupapi.lib")
+#pragma comment(lib, "newdev.lib")
+
+namespace rdapp {
+
+constexpr wchar_t kVirtualMonitorHwId[] = L"root\\RemoteDisplayVirtual";
+
+// The Display device setup class.
+inline const GUID& DisplayClassGuid() {
+    static const GUID g = {0x4d36e968, 0xe325, 0x11ce, {0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18}};
+    return g;
+}
+
+inline std::wstring LastErrorText(const wchar_t* what) {
+    return std::wstring(what) + L" (error " + std::to_wstring(GetLastError()) + L")";
+}
+
+// Creates the device and installs the driver from `infPath` (a driver package INF). Returns false with
+// `err` set if anything fails. A reboot may be needed after the first install; `rebootNeeded` says so.
+inline bool AddVirtualMonitor(const std::wstring& infPath, std::wstring& err, bool& rebootNeeded) {
+    rebootNeeded = false;
+    HDEVINFO set = SetupDiCreateDeviceInfoList(&DisplayClassGuid(), nullptr);
+    if (set == INVALID_HANDLE_VALUE) {
+        err = LastErrorText(L"SetupDiCreateDeviceInfoList");
+        return false;
+    }
+    bool ok = false;
+    SP_DEVINFO_DATA dev = {sizeof(dev)};
+    do {
+        if (!SetupDiCreateDeviceInfoW(set, L"Display", &DisplayClassGuid(), L"RemoteDisplay Virtual Monitor", nullptr,
+                                      DICD_GENERATE_ID, &dev)) {
+            err = LastErrorText(L"SetupDiCreateDeviceInfo");
+            break;
+        }
+        // The hardware ID list is multi-string: each string ends with NUL and the list ends with another NUL.
+        std::wstring ids = kVirtualMonitorHwId;
+        ids.push_back(L'\0');
+        ids.push_back(L'\0');
+        if (!SetupDiSetDeviceRegistryPropertyW(set, &dev, SPDRP_HARDWAREID, reinterpret_cast<const BYTE*>(ids.data()),
+                                               DWORD(ids.size() * sizeof(wchar_t)))) {
+            err = LastErrorText(L"SetupDiSetDeviceRegistryProperty");
+            break;
+        }
+        if (!SetupDiCallClassInstaller(DIF_REGISTERDEVICE, set, &dev)) {
+            err = LastErrorText(L"SetupDiCallClassInstaller(DIF_REGISTERDEVICE)");
+            break;
+        }
+        BOOL reboot = FALSE;
+        if (!UpdateDriverForPlugAndPlayDevicesW(nullptr, kVirtualMonitorHwId, infPath.c_str(), INSTALLFLAG_FORCE, &reboot)) {
+            err = LastErrorText(L"UpdateDriverForPlugAndPlayDevices");
+            // Do not leave an empty device behind.
+            SetupDiCallClassInstaller(DIF_REMOVE, set, &dev);
+            break;
+        }
+        rebootNeeded = reboot != FALSE;
+        ok = true;
+    } while (false);
+    SetupDiDestroyDeviceInfoList(set);
+    return ok;
+}
+
+// True if the device's hardware ID list contains the virtual monitor's ID.
+inline bool HasVirtualMonitorHwId(HDEVINFO set, SP_DEVINFO_DATA& dev) {
+    DWORD type = 0, size = 0;
+    SetupDiGetDeviceRegistryPropertyW(set, &dev, SPDRP_HARDWAREID, &type, nullptr, 0, &size);
+    if (size == 0) return false;
+    std::wstring buf(size / sizeof(wchar_t) + 1, L'\0');
+    if (!SetupDiGetDeviceRegistryPropertyW(set, &dev, SPDRP_HARDWAREID, &type, reinterpret_cast<PBYTE>(buf.data()), size, &size))
+        return false;
+    for (const wchar_t* p = buf.c_str(); *p; p += wcslen(p) + 1)
+        if (_wcsicmp(p, kVirtualMonitorHwId) == 0) return true;
+    return false;
+}
+
+// Removes every virtual monitor device. Returns true if none is left (also when none existed).
+inline bool RemoveVirtualMonitor(std::wstring& err) {
+    HDEVINFO set = SetupDiGetClassDevsW(&DisplayClassGuid(), nullptr, nullptr, 0);
+    if (set == INVALID_HANDLE_VALUE) {
+        err = LastErrorText(L"SetupDiGetClassDevs");
+        return false;
+    }
+    bool ok = true;
+    SP_DEVINFO_DATA dev = {sizeof(dev)};
+    // Removing a device shifts the indexes, so after each removal start again from the top.
+    for (DWORD i = 0; SetupDiEnumDeviceInfo(set, i, &dev);) {
+        if (!HasVirtualMonitorHwId(set, dev)) {
+            ++i;
+            continue;
+        }
+        if (SetupDiCallClassInstaller(DIF_REMOVE, set, &dev)) {
+            i = 0;
+        } else {
+            err = LastErrorText(L"SetupDiCallClassInstaller(DIF_REMOVE)");
+            ok = false;
+            ++i;
+        }
+    }
+    SetupDiDestroyDeviceInfoList(set);
+    return ok;
+}
+
+}  // namespace rdapp
