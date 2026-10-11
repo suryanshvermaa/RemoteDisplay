@@ -40,7 +40,7 @@ enum Ctl {
     IDC_IPS = 100, IDC_COPY_IP, IDC_KEY, IDC_COPY_KEY, IDC_NEW_KEY, IDC_APPROVE, IDC_SHARE, IDC_STATUS,
     IDC_DISCONNECT, IDC_REMOTE, IDC_REMOTE_KEY, IDC_CONNECT, IDC_MSG, IDC_HINT,
     IDC_LBL_ADDR, IDC_LBL_KEY, IDC_LBL_RADDR, IDC_LBL_RKEY, IDC_TITLE_L, IDC_TITLE_R,
-    IDC_SVC_TITLE, IDC_SVC_STATUS, IDC_SVC_BTN, IDC_SVC_HINT, IDC_CONTROL, IDC_AUTOSTART, IDC_SHOWTRAY, IDC_TRUSTED, IDC_ADMIN, IDC_ADMIN_STATE, IDC_SVC_REMOVE, IDC_SECURE,
+    IDC_SVC_TITLE, IDC_SVC_STATUS, IDC_SVC_BTN, IDC_SVC_HINT, IDC_CONTROL, IDC_AUTOSTART, IDC_SHOWTRAY, IDC_TRUSTED, IDC_ADMIN, IDC_ADMIN_STATE, IDC_SVC_REMOVE, IDC_SECURE, IDC_DISPLAY_DUP, IDC_DISPLAY_EXT,
 };
 enum class Elev { SvcInstall, SvcUninstall, AdminOn, AdminOff, TaskOn, TaskOff, SecureOn, SecureOff };
 enum TrayCmd { IDM_OPEN = 2001, IDM_TOGGLE, IDM_DISCONNECT, IDM_EXIT };
@@ -107,6 +107,7 @@ HICON MakeIcon(int n, COLORREF dot, bool showDot) {
 class App {
 public:
     static int Run(HINSTANCE inst, bool background, bool autoShare) {
+        DisplayModeSession::RecoverIfNeeded();  // a previous run killed mid-session must not leave the screens switched
         WSADATA wsa;
         WSAStartup(MAKEWORD(2, 2), &wsa);
         timeBeginPeriod(1);
@@ -126,7 +127,7 @@ public:
         app.background_ = background;
         app.autoShare_ = autoShare;
         app.dpi_ = GetDeviceCaps(GetDC(nullptr), LOGPIXELSX);
-        RECT rc = {0, 0, app.S(820), app.S(660)};
+        RECT rc = {0, 0, app.S(820), app.S(688)};
         AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
         HWND h = CreateWindowW(L"RemoteDisplayApp", L"RemoteDisplay",
                                WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN,
@@ -199,20 +200,22 @@ private:
         Add(L"BUTTON", L"Trusted devices...", BS_PUSHBUTTON | WS_TABSTOP, 204, 278, 160, 24, IDC_TRUSTED);
         Add(L"BUTTON", L"Ask me before allowing a connection", BS_AUTOCHECKBOX | WS_TABSTOP, 44, 306, 320, 24, IDC_APPROVE);
         Add(L"BUTTON", L"Allow mouse and keyboard control", BS_AUTOCHECKBOX | WS_TABSTOP, 44, 332, 320, 24, IDC_CONTROL);
-        Add(L"BUTTON", L"Start sharing", BS_OWNERDRAW | WS_TABSTOP, 44, 364, 320, 40, IDC_SHARE);
-        Add(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS, 44, 414, 226, 20, IDC_STATUS);
-        Add(L"BUTTON", L"Disconnect", BS_PUSHBUTTON | WS_TABSTOP, 276, 412, 88, 24, IDC_DISCONNECT);
+        Add(L"BUTTON", L"Duplicate displays while sharing", BS_AUTOCHECKBOX | WS_TABSTOP, 44, 364, 200, 24, IDC_DISPLAY_DUP);
+        Add(L"BUTTON", L"Extend: stream virtual monitor", BS_AUTOCHECKBOX | WS_TABSTOP, 44, 388, 260, 24, IDC_DISPLAY_EXT);
+        Add(L"BUTTON", L"Start sharing", BS_OWNERDRAW | WS_TABSTOP, 44, 420, 320, 40, IDC_SHARE);
+        Add(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS, 44, 442, 226, 20, IDC_STATUS);
+        Add(L"BUTTON", L"Disconnect", BS_PUSHBUTTON | WS_TABSTOP, 276, 440, 88, 24, IDC_DISCONNECT);
 
         // ---- background service (bottom of the left card)
-        Add(L"STATIC", L"RUN IN BACKGROUND", SS_LEFT, 44, 444, 200, 16, IDC_SVC_TITLE);
-        Add(L"BUTTON", L"Start with Windows", BS_AUTOCHECKBOX | WS_TABSTOP, 44, 464, 170, 24, IDC_AUTOSTART);
-        Add(L"BUTTON", L"Show tray icon", BS_AUTOCHECKBOX | WS_TABSTOP, 224, 464, 140, 24, IDC_SHOWTRAY);
-        Add(L"BUTTON", L"Run as administrator", BS_AUTOCHECKBOX | WS_TABSTOP, 44, 492, 190, 24, IDC_ADMIN);
-        Add(L"BUTTON", L"Restart as admin", BS_PUSHBUTTON | WS_TABSTOP, 244, 490, 120, 26, IDC_ADMIN_STATE);
-        Add(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS, 44, 552, 320, 22, IDC_SVC_STATUS);
-        Add(L"BUTTON", L"Install service", BS_PUSHBUTTON | WS_TABSTOP, 44, 580, 150, 28, IDC_SVC_BTN);
-        Add(L"BUTTON", L"Uninstall service", BS_PUSHBUTTON | WS_TABSTOP, 204, 580, 160, 28, IDC_SVC_REMOVE);
-        Add(L"BUTTON", L"Allow viewing UAC and sign-in screens (admin)", BS_AUTOCHECKBOX | WS_TABSTOP, 44, 520, 360, 24, IDC_SECURE);
+        Add(L"STATIC", L"RUN IN BACKGROUND", SS_LEFT, 44, 472, 200, 16, IDC_SVC_TITLE);
+        Add(L"BUTTON", L"Start with Windows", BS_AUTOCHECKBOX | WS_TABSTOP, 44, 492, 170, 24, IDC_AUTOSTART);
+        Add(L"BUTTON", L"Show tray icon", BS_AUTOCHECKBOX | WS_TABSTOP, 224, 492, 140, 24, IDC_SHOWTRAY);
+        Add(L"BUTTON", L"Run as administrator", BS_AUTOCHECKBOX | WS_TABSTOP, 44, 520, 190, 24, IDC_ADMIN);
+        Add(L"BUTTON", L"Restart as admin", BS_PUSHBUTTON | WS_TABSTOP, 244, 518, 120, 26, IDC_ADMIN_STATE);
+        Add(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS, 44, 580, 320, 22, IDC_SVC_STATUS);
+        Add(L"BUTTON", L"Install service", BS_PUSHBUTTON | WS_TABSTOP, 44, 608, 150, 28, IDC_SVC_BTN);
+        Add(L"BUTTON", L"Uninstall service", BS_PUSHBUTTON | WS_TABSTOP, 204, 608, 160, 28, IDC_SVC_REMOVE);
+        Add(L"BUTTON", L"Allow viewing UAC and sign-in screens (admin)", BS_AUTOCHECKBOX | WS_TABSTOP, 44, 548, 360, 24, IDC_SECURE);
 
         // ---- right card: connect
         Add(L"STATIC", L"REMOTE PC", SS_LEFT, 436, 108, 200, 16, IDC_LBL_RADDR + 100);
@@ -232,6 +235,8 @@ private:
         SetText(IDC_KEY, W(rd::FormatKey(hostCfg_.psk.data())));
         CheckDlgButton(hwnd_, IDC_APPROVE, hostCfg_.requireApproval ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hwnd_, IDC_CONTROL, hostCfg_.allowControl ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hwnd_, IDC_DISPLAY_DUP, cfg_->DisplayMode() == "duplicate" ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hwnd_, IDC_DISPLAY_EXT, cfg_->DisplayMode() == "extend" ? BST_CHECKED : BST_UNCHECKED);
         ShowWindow(Ctrl(IDC_DISCONNECT), SW_HIDE);
 
         recents_ = cfg_->Recents();
@@ -371,6 +376,7 @@ private:
         stopHost_ = true;
         if (hostThread_.joinable()) hostThread_.join();
         stopHost_ = false;
+        displaySession_.End();  // put the screens back as they were
         host_.state = rdh::HostStatus::Stopped;
         ownLock_.Release();
     }
@@ -509,6 +515,9 @@ private:
             host_.state = rdh::HostStatus::Starting;
             host_.approve = host_.deny = host_.kick = false;
             promptShown_ = false;
+            const std::string mode = cfg_->DisplayMode();
+            const bool applied = displaySession_.Begin(mode);  // once only: a second Begin would save the changed layout
+            hostCfg_.displayName = applied && mode == "extend" ? rdapp::FindVirtualMonitorDisplay() : std::wstring();
             hostThread_ = std::thread([this] { rdh::RunHost(hostCfg_, stopHost_, host_); });
         }
         UpdateUi();
@@ -773,14 +782,14 @@ private:
         HBRUSH card = CreateSolidBrush(kCard);
         SelectObject(mem, pen);
         SelectObject(mem, card);
-        RoundRect(mem, S(24), S(96), S(404), S(620), S(14), S(14));
-        RoundRect(mem, S(416), S(96), S(796), S(620), S(14), S(14));
+        RoundRect(mem, S(24), S(96), S(404), S(648), S(14), S(14));
+        RoundRect(mem, S(416), S(96), S(796), S(648), S(14), S(14));
         DeleteObject(pen);
         DeleteObject(card);
 
         SetTextColor(mem, kMuted);
         SelectObject(mem, fontSmall_);
-        TextOutW(mem, S(26), S(632), L"AES-128-GCM encrypted. Connections need your pairing key.", 56);
+        TextOutW(mem, S(26), S(660), L"AES-128-GCM encrypted. Connections need your pairing key.", 56);
 
         BitBlt(dc, 0, 0, cr.right, cr.bottom, mem, 0, 0, SRCCOPY);
         SelectObject(mem, old);
@@ -1020,6 +1029,22 @@ private:
                         cfg_->SetRequireApproval(IsDlgButtonChecked(h, IDC_APPROVE) == BST_CHECKED);
                         ApplyToService();
                         break;
+                    case IDC_DISPLAY_DUP:
+                    case IDC_DISPLAY_EXT: {
+                        // One choice at a time: ticking one clears the other; clearing both leaves the screens alone.
+                        const bool dup = IsDlgButtonChecked(h, IDC_DISPLAY_DUP) == BST_CHECKED;
+                        const bool ext = IsDlgButtonChecked(h, IDC_DISPLAY_EXT) == BST_CHECKED;
+                        if (LOWORD(w) == IDC_DISPLAY_DUP && dup) CheckDlgButton(h, IDC_DISPLAY_EXT, BST_UNCHECKED);
+                        if (LOWORD(w) == IDC_DISPLAY_EXT && ext) CheckDlgButton(h, IDC_DISPLAY_DUP, BST_UNCHECKED);
+                        cfg_->SetDisplayMode(IsDlgButtonChecked(h, IDC_DISPLAY_DUP) == BST_CHECKED ? "duplicate"
+                                             : IsDlgButtonChecked(h, IDC_DISPLAY_EXT) == BST_CHECKED ? "extend" : "");
+                        Message(IsDlgButtonChecked(h, IDC_DISPLAY_DUP) == BST_CHECKED
+                                    ? L"Screens will be duplicated while sharing, then put back."
+                                : IsDlgButtonChecked(h, IDC_DISPLAY_EXT) == BST_CHECKED
+                                    ? L"The virtual monitor will be streamed while sharing."
+                                    : L"The screens are left as they are.", kMuted);
+                        break;
+                    }
                     case IDC_CONTROL:
                         cfg_->SetAllowControl(IsDlgButtonChecked(h, IDC_CONTROL) == BST_CHECKED);
                         hostCfg_.allowControl = IsDlgButtonChecked(h, IDC_CONTROL) == BST_CHECKED;  // live for this window's host
@@ -1073,6 +1098,7 @@ private:
 
     bool adminPref_ = false, autoShare_ = false;
     Elev elevTag_ = Elev::SvcInstall;
+    DisplayModeSession displaySession_;  // Duplicate / Extend while sharing
     bool background_ = false, forceExit_ = false, tipShown_ = false, trayAdded_ = false, showTray_ = true;
     UINT taskbarCreated_ = 0;
     HICON trayIcons_[3] = {};

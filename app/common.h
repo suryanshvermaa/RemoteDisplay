@@ -119,6 +119,9 @@ public:
     void SetAdminMode(bool v) const { Set(L"app", L"admin", v ? "1" : "0"); }
     void SetShowTray(bool v) const { Set(L"app", L"tray", v ? "1" : "0"); }
     void SetAllowControl(bool v) const { Set(L"host", L"control", v ? "1" : "0"); }
+    // What the screens do while sharing: "duplicate", "extend", or empty (leave them alone).
+    std::string DisplayMode() const { return Get(L"host", L"display_mode"); }
+    void SetDisplayMode(const std::string& v) const { Set(L"host", L"display_mode", v); }
     void SetRequireApproval(bool v) const { Set(L"host", L"approve", v ? "1" : "0"); }
 
     std::vector<Recent> Recents() const {

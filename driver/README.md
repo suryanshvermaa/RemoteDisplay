@@ -90,3 +90,17 @@ With the virtual monitor extended (Win+P, Extend), the app finds the display who
 `RD Virtual` and captures it. If there is no such display, it falls back to the first screen and says
 so in the log. `build\Release\test-display.exe` checks the same path: it reports the display it found,
 the size, and the frames it gets.
+
+## Duplicate and Extend while sharing
+
+The sharing card has two choices. They are mutually exclusive, and neither one is set by default.
+
+- **Duplicate displays while sharing**: while sharing, Windows shows the same picture on every screen.
+  The layout you had before sharing is saved and put back when sharing stops. If the app was killed
+  mid-session, the saved layout is put back the next time the app or the worker starts.
+- **Extend: stream virtual monitor**: the screens stay extended, and the streamed picture is the virtual
+  monitor.
+
+The choice is stored as `display_mode` under `[host]` in `config.ini` (`duplicate`, `extend`, or empty).
+Tested here: ticking Duplicate mirrors the screens while sharing (one display in the layout), stopping
+restores both, and the restore also happens at the next start after a kill.

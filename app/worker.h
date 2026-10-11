@@ -13,6 +13,7 @@
 #include "host.h"
 #include "shared.h"
 #include "virtual_monitor.h"
+#include "display_mode.h"
 
 namespace rdapp {
 
@@ -37,8 +38,13 @@ inline int RunWorker() {
     hc.psk = cfg.HostKey();
     hc.requireApproval = cfg.RequireApproval();
     hc.allowControl = cfg.AllowControl();
-    // [host] display=virtual captures the virtual monitor (see driver\) instead of the first screen.
-    if (cfg.Get(L"host", L"display") == "virtual") {
+    // Duplicate or Extend while sharing. A layout left by a worker that was killed is put back first.
+    DisplayModeSession displaySession;
+    DisplayModeSession::RecoverIfNeeded();
+    const std::string displayMode = cfg.DisplayMode();
+    if (displaySession.Begin(displayMode)) Log(log, "display layout: %s while sharing", displayMode.c_str());
+    // [host] display=virtual, or display_mode=extend, captures the virtual monitor instead of the first screen.
+    if (cfg.Get(L"host", L"display") == "virtual" || displayMode == "extend") {
         hc.displayName = rdapp::FindVirtualMonitorDisplay();
         Log(log, "capture target: %ls", hc.displayName.empty() ? L"virtual monitor not found (using the first screen)" : hc.displayName.c_str());
     }
@@ -80,6 +86,7 @@ inline int RunWorker() {
             if (status.KickRequested()) st.kick = true;
             if (status.RestartRequested()) {  // settings changed (key, approval, admin mode): the service relaunches us
                 Log(log, "restart requested by the app");
+                displaySession.End();  // ExitProcess skips destructors: put the layout back first
                 ExitProcess(0);
             }
 
