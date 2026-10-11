@@ -10,7 +10,10 @@ $ErrorActionPreference = "Stop"
 
 $wdk = "C:\Program Files (x86)\Windows Kits\10"
 $sdk = "10.0.26100.0"
-$wdfVer = "2.33"
+# UMDF framework version. The OS must provide it: this PC's Windows only has WUDFx02000 and rejects 2.33
+# (the WUDF coinstaller fails with error 87). Keep this, the headers, the stub and the INF in step.
+$wdfVer = "2.15"
+$wdfMinor = $wdfVer.Split(".")[1]
 $msvc = "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.51.36231"
 $cl = "$msvc\bin\Hostx64\x64\cl.exe"
 $link = "$msvc\bin\Hostx64\x64\link.exe"
@@ -34,7 +37,7 @@ $cflags = @(
     "/nologo", "/c", "/EHsc", "/std:c++20", "/W3", "/WX", "/MT",
     "/D", "UNICODE", "/D", "_UNICODE",
     "/D", "_WIN32_WINNT=0x0A00", "/D", "WINVER=0x0A00", "/D", "NTDDI_VERSION=0x0A000008",
-    "/D", "UMDF_USING_NTSTATUS"
+    "/D", "UMDF_USING_NTSTATUS", "/D", "UMDF_VERSION_MAJOR=2", "/D", "UMDF_VERSION_MINOR=$wdfMinor"
 )
 foreach ($i in $incs) { $cflags += @("/I", $i) }
 
@@ -70,7 +73,10 @@ if ($Package) {
     Remove-Item -Recurse -Force $pkg -ErrorAction SilentlyContinue
     New-Item -ItemType Directory -Force $pkg | Out-Null
     Copy-Item $dll (Join-Path $pkg "RemoteDisplayVirtual.dll")
-    Copy-Item (Join-Path $root "driver\inf\RemoteDisplayVirtual.inf") $pkg
+    # The INF names the UMDF version it was built for.
+    # The coinstaller reads the version as major.minor.build (the in-box drivers write e.g. 1.11.0); "2.15" alone is rejected.
+    (Get-Content (Join-Path $root "driver\inf\RemoteDisplayVirtual.inf") -Raw).Replace('$UMDFVERSION$', "$wdfVer.0") |
+        Set-Content -Encoding ascii (Join-Path $pkg "RemoteDisplayVirtual.inf")
 
     $stampinf = "$wdk\bin\$sdk\x64\stampinf.exe"
     $inf2cat = "$wdk\bin\$sdk\x86\Inf2Cat.exe"

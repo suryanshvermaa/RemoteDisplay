@@ -7,8 +7,7 @@
 //
 // Build and install: see driver/README.md.
 
-#define UMDF_VERSION_MAJOR 2
-#define UMDF_VERSION_MINOR 33
+// UMDF_VERSION_MAJOR / MINOR are set by driver\build.ps1 (they must match the headers and stub used).
 
 #include <windows.h>
 #include <wdf.h>
@@ -31,7 +30,8 @@ public:
     void Stop();
 
 private:
-    void Run();
+    void Run();  // thread entry: processes frames, then deletes the swap-chain object
+    void ProcessFrames();
 
     IDDCX_SWAPCHAIN swapChain_;
     HANDLE nextSurfaceAvailable_;

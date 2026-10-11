@@ -40,6 +40,8 @@ inline bool AddVirtualMonitor(const std::wstring& infPath, std::wstring& err, bo
     bool ok = false;
     SP_DEVINFO_DATA dev = {sizeof(dev)};
     do {
+        // The device is named after its class, as devcon does: the instance ID becomes ROOT\DISPLAY\<n>.
+        // (Naming it by the hardware ID is rejected with ERROR_INVALID_DEVINST_NAME.)
         if (!SetupDiCreateDeviceInfoW(set, L"Display", &DisplayClassGuid(), L"RemoteDisplay Virtual Monitor", nullptr,
                                       DICD_GENERATE_ID, &dev)) {
             err = LastErrorText(L"SetupDiCreateDeviceInfo");
@@ -58,9 +60,15 @@ inline bool AddVirtualMonitor(const std::wstring& infPath, std::wstring& err, bo
             err = LastErrorText(L"SetupDiCallClassInstaller(DIF_REGISTERDEVICE)");
             break;
         }
+        // First let Windows find the package in the driver store (pnputil /add-driver put it there).
+        // If that fails, install straight from the INF file.
         BOOL reboot = FALSE;
-        if (!UpdateDriverForPlugAndPlayDevicesW(nullptr, kVirtualMonitorHwId, infPath.c_str(), INSTALLFLAG_FORCE, &reboot)) {
-            err = LastErrorText(L"UpdateDriverForPlugAndPlayDevices");
+        BOOL installed = UpdateDriverForPlugAndPlayDevicesW(nullptr, kVirtualMonitorHwId, nullptr, 0, &reboot);
+        const DWORD storeErr = installed ? 0 : GetLastError();
+        if (!installed) installed = UpdateDriverForPlugAndPlayDevicesW(nullptr, kVirtualMonitorHwId, infPath.c_str(), INSTALLFLAG_FORCE, &reboot);
+        if (!installed) {
+            err = L"UpdateDriverForPlugAndPlayDevices failed: from the driver store (error " + std::to_wstring(storeErr) +
+                  L"), from " + infPath + L" (error " + std::to_wstring(GetLastError()) + L")";
             // Do not leave an empty device behind.
             SetupDiCallClassInstaller(DIF_REMOVE, set, &dev);
             break;

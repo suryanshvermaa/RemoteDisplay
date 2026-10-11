@@ -1,25 +1,25 @@
 ; RemoteDisplay virtual monitor: an IddCx (indirect display) UMDF 2 driver.
 ; The device is created by the app (see app\virtual_monitor.h) with the hardware ID below.
-; stampinf sets DriverVer at package time; see driver\build.ps1.
+;
+; The layout follows Windows' own IddCx driver (rdpidd.inf), which is known to install on this OS:
+;  - the WUDF reflector comes from wudfrd.inf (Include / Needs), not a hand-written service,
+;  - UmdfLibraryVersion, ServiceBinary and UmdfExtensions live in the service section,
+;  - the device has the IndirectKmd upper filter, the kernel helper every IddCx driver needs,
+;  - the DLL stays in the driver store (DIRID 13).
+; build.ps1 fills in $UMDFVERSION$ and stampinf sets DriverVer.
 
 [Version]
 Signature   = "$WINDOWS NT$"
-Class       = Display
 ClassGuid   = {4d36e968-e325-11ce-bfc1-08002be10318}
+Class       = Display
+ClassVer    = 2.0
 Provider    = %ManufacturerName%
 CatalogFile = RemoteDisplayVirtual.cat
 DriverVer   = 01/01/2026,1.0.0.0
 PnpLockdown = 1
 
-[DestinationDirs]
-DefaultDestDir = 12
-UMDriverCopy   = 12,UMDF
-
-[SourceDisksNames]
-1 = %DiskName%,,,""
-
-[SourceDisksFiles]
-RemoteDisplayVirtual.dll = 1
+[ControlFlags]
+PreConfigureDriver = *
 
 [Manufacturer]
 %ManufacturerName% = Standard,NTamd64
@@ -27,32 +27,49 @@ RemoteDisplayVirtual.dll = 1
 [Standard.NTamd64]
 %DeviceName% = RemoteDisplayVirtual_Install, root\RemoteDisplayVirtual
 
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+RemoteDisplayVirtual.dll = 1
+
+[DestinationDirs]
+UMDriverCopy = 13
+
 [RemoteDisplayVirtual_Install.NT]
 CopyFiles = UMDriverCopy
+Include   = wudfrd.inf
+Needs     = WUDFRD.NT
+
+[RemoteDisplayVirtual_Install.NT.hw]
+AddReg  = RemoteDisplayVirtual_HardwareDeviceSettings
+Include = wudfrd.inf
+Needs   = WUDFRD.NT.HW
 
 [RemoteDisplayVirtual_Install.NT.Services]
-AddService = WUDFRd, 0x000001fa, WUDFRd_Service_Inst
-
-[WUDFRd_Service_Inst]
-ServiceType   = 1
-StartType     = 3
-ErrorControl  = 1
-ServiceBinary = %12%\WUDFRd.sys
+Include = wudfrd.inf
+Needs   = WUDFRD.NT.Services
 
 [RemoteDisplayVirtual_Install.NT.Wdf]
-UmdfService                 = RemoteDisplayVirtual, RemoteDisplayVirtual_Service
-UmdfServiceOrder            = RemoteDisplayVirtual
-UmdfKernelModeClientPolicy  = AllowKernelModeClients
-UmdfFileObjectPolicy        = AllowNullAndUnknownFileObjects
-UmdfFsContextUsePolicy      = CanUseFsContextUsePolicy
-UmdfMethodNeitherAction     = Copy
-UmdfExtensions              = IddCx0102
+UmdfService                = RemoteDisplayVirtual, RemoteDisplayVirtual_Install
+UmdfServiceOrder           = RemoteDisplayVirtual
+UmdfKernelModeClientPolicy = AllowKernelModeClients
+UmdfHostProcessSharing     = ProcessSharingDisabled
+UmdfImpersonationLevel     = Identification
 
-[RemoteDisplayVirtual_Service]
-UmdfLibraryVersion = 2.33
-ServiceBinary      = %12%\UMDF\RemoteDisplayVirtual.dll
+[RemoteDisplayVirtual_Install]
+UmdfLibraryVersion = $UMDFVERSION$
+ServiceBinary      = %13%\RemoteDisplayVirtual.dll
+UmdfExtensions     = IddCx0102
+
+[UMDriverCopy]
+RemoteDisplayVirtual.dll,,,0x100
+
+[RemoteDisplayVirtual_HardwareDeviceSettings]
+HKR,, "UpperFilters", %REG_MULTI_SZ%, "IndirectKmd"
 
 [Strings]
+REG_MULTI_SZ     = 0x00010000
 ManufacturerName = "RemoteDisplay"
 DiskName         = "RemoteDisplay Virtual Monitor Installation Disk"
 DeviceName       = "RemoteDisplay Virtual Monitor"
