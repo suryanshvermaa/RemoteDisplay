@@ -7,6 +7,7 @@
 
 #include "host.h"
 #include "secure_feed.h"  // test mode only, see RD_SECURE_TEST below
+#include "virtual_monitor.h"  // RD_DISPLAY=virtual: capture the virtual monitor
 
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
@@ -39,6 +40,12 @@ int main(int argc, char** argv) {
     // Test mode (RD_SECURE_TEST=1): frames come from the secure-desktop helper's shared picture instead of
     // our own capture, so viewer checks cover the handoff, upload and encode of that path. Start the helper
     // yourself first: RemoteDisplay.exe --secure-helper --force (a separate process, as in production).
+    // RD_DISPLAY=virtual captures the virtual monitor (the one named "RD Virtual") instead of the first screen.
+    if (const char* d = getenv("RD_DISPLAY"); d && std::string(d) == "virtual") {
+        cfg.displayName = rdapp::FindVirtualMonitorDisplay();
+        printf(cfg.displayName.empty() ? "capture: virtual monitor not found, using the first screen\n"
+                                       : "capture: virtual monitor\n");
+    }
     static rdapp::SecureFeedReader secureFeed;
     if (getenv("RD_SECURE_TEST")) {
         cfg.secure = &secureFeed;
