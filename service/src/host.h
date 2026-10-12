@@ -305,6 +305,17 @@ inline void RunHost(const HostConfig& cfg, std::atomic<bool>& stop, HostStatus& 
             int fl = sizeof(from);
             int n = recvfrom(sock.s, reinterpret_cast<char*>(rbuf), sizeof(rbuf), 0,
                              reinterpret_cast<sockaddr*>(&from), &fl);
+            if (n == int(sizeof(rd::kDiscoverQuery)) && memcmp(rbuf, rd::kDiscoverQuery, sizeof(rd::kDiscoverQuery)) == 0) {
+                // LAN discovery: answer with the computer name (no key, no session).
+                char name[64] = {};
+                gethostname(name, sizeof(name) - 1);
+                char reply[sizeof(rd::kDiscoverReply) + sizeof(name)];
+                memcpy(reply, rd::kDiscoverReply, sizeof(rd::kDiscoverReply));
+                const size_t len = strlen(name);
+                memcpy(reply + sizeof(rd::kDiscoverReply), name, len);
+                sendto(sock.s, reply, int(sizeof(rd::kDiscoverReply) + len), 0, reinterpret_cast<sockaddr*>(&from), sizeof(from));
+                continue;
+            }
             if (n < int(sizeof(rd::WireHeader))) break;
             rd::WireHeader wh;
             memcpy(&wh, rbuf, sizeof(wh));

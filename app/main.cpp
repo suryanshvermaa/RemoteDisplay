@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "admin.h"
+#include "discovery.h"
 #include "secure.h"
 #include "secure_helper.h"
 #include "common.h"
@@ -40,13 +41,13 @@ enum Ctl {
     IDC_IPS = 100, IDC_COPY_IP, IDC_KEY, IDC_COPY_KEY, IDC_NEW_KEY, IDC_APPROVE, IDC_SHARE, IDC_STATUS,
     IDC_DISCONNECT, IDC_REMOTE, IDC_REMOTE_KEY, IDC_CONNECT, IDC_MSG, IDC_HINT,
     IDC_LBL_ADDR, IDC_LBL_KEY, IDC_LBL_RADDR, IDC_LBL_RKEY, IDC_TITLE_L, IDC_TITLE_R,
-    IDC_SVC_TITLE, IDC_SVC_STATUS, IDC_SVC_BTN, IDC_SVC_HINT, IDC_CONTROL, IDC_AUTOSTART, IDC_SHOWTRAY, IDC_TRUSTED, IDC_ADMIN, IDC_ADMIN_STATE, IDC_SVC_REMOVE, IDC_SECURE, IDC_DISPLAY_DUP, IDC_DISPLAY_EXT,
+    IDC_SVC_TITLE, IDC_SVC_STATUS, IDC_SVC_BTN, IDC_SVC_HINT, IDC_CONTROL, IDC_AUTOSTART, IDC_SHOWTRAY, IDC_TRUSTED, IDC_ADMIN, IDC_ADMIN_STATE, IDC_SVC_REMOVE, IDC_SECURE, IDC_DISPLAY_DUP, IDC_DISPLAY_EXT, IDC_FIND_DEVICES,
 };
 enum class Elev { SvcInstall, SvcUninstall, AdminOn, AdminOff, TaskOn, TaskOff, SecureOn, SecureOff };
 enum TrayCmd { IDM_OPEN = 2001, IDM_TOGGLE, IDM_DISCONNECT, IDM_EXIT };
 constexpr UINT kMsgViewerClosed = WM_APP + 10, kMsgSvcDone = WM_APP + 11, kMsgTray = WM_APP + 20,
-               kMsgShow = WM_APP + 21;
-constexpr UINT_PTR kTimerUi = 1, kTimerCopied = 2;
+               kMsgShow = WM_APP + 21, kMsgDevices = WM_APP + 30;
+constexpr UINT_PTR kTimerUi = 1, kTimerCopied = 2, kTimerFind = 3;
 
 constexpr COLORREF kBg = RGB(238, 241, 245), kCard = RGB(255, 255, 255), kBorder = RGB(217, 222, 231),
                    kNavy = RGB(24, 34, 58), kAccent = RGB(37, 99, 235), kGreen = RGB(22, 163, 74),
@@ -225,6 +226,7 @@ private:
         Add(L"STATIC", L"Pairing key", SS_LEFT, 436, 224, 200, 18, IDC_LBL_RKEY);
         Add(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, 436, 244, 340, 28, IDC_REMOTE_KEY, WS_EX_CLIENTEDGE);
         Add(L"STATIC", L"Enter the address and pairing key shown in the other PC's RemoteDisplay window.", SS_LEFT, 436, 282, 340, 44, IDC_HINT);
+        Add(L"BUTTON", L"Find devices on this network", BS_PUSHBUTTON | WS_TABSTOP, 436, 330, 340, 28, IDC_FIND_DEVICES);
         Add(L"BUTTON", L"Connect", BS_OWNERDRAW | WS_TABSTOP, 436, 364, 340, 40, IDC_CONNECT);
         Add(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS, 436, 414, 340, 20, IDC_MSG);
 
@@ -240,7 +242,7 @@ private:
         ShowWindow(Ctrl(IDC_DISCONNECT), SW_HIDE);
 
         recents_ = cfg_->Recents();
-        for (const auto& r : recents_) SendMessageW(Ctrl(IDC_REMOTE), CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(W(r.addr).c_str()));
+        RefreshRemoteList();
         if (!recents_.empty()) {
             SendMessage(Ctrl(IDC_REMOTE), CB_SETCURSEL, 0, 0);
             FillRemoteKey(0);
@@ -263,6 +265,8 @@ private:
             trayIcons_[i] = MakeIcon(GetSystemMetrics(SM_CXSMICON), cols[i], true);
         }
         SetTimer(hwnd_, kTimerUi, 250, nullptr);
+        SetTimer(hwnd_, kTimerFind, 15000, nullptr);  // keeps the device list fresh while the window is open
+        StartFindDevices();
         UpdateUi();
         AddTray();
         if ((background_ || autoShare_) && svcState_ != SvcState::Running && !Sharing()) {  // started with Windows / restarted
@@ -332,6 +336,64 @@ private:
 
     void FillRemoteKey(size_t i) {
         if (i < recents_.size()) SetText(IDC_REMOTE_KEY, W(rd::FormatKey(recents_[i].key.data())));
+    }
+
+    // ---- LAN device search ----------------------------------------------------------------
+    // Runs in the background so the window stays responsive; the answer comes back as kMsgDevices.
+    void StartFindDevices(bool fromUser = false) {
+        if (fromUser) {
+            findFromUser_ = true;
+            Message(L"Searching the network...", kMuted);
+        }
+        if (findBusy_) return;
+        findBusy_ = true;
+        const HWND target = hwnd_;
+        std::thread([target] {
+            auto* found = new std::vector<FoundDevice>(FindDevices());
+            if (!PostMessageW(target, kMsgDevices, 0, reinterpret_cast<LPARAM>(found))) delete found;
+        }).detach();
+    }
+
+    void OnDevicesFound(const std::vector<FoundDevice>& found) {
+        // This PC's own addresses are not listed: it is not a remote device.
+        const auto mine = LocalIPv4();
+        std::vector<FoundDevice> list;
+        for (const auto& d : found) {
+            if (std::find(mine.begin(), mine.end(), d.ip) == mine.end()) list.push_back(d);
+        }
+        const bool same = list.size() == found_.size() &&
+                          std::equal(list.begin(), list.end(), found_.begin(),
+                                     [](const FoundDevice& a, const FoundDevice& b) { return a.ip == b.ip && a.name == b.name; });
+        if (!same) {  // only rebuild the list when it changed, so an open dropdown is not disturbed
+            found_ = list;
+            RefreshRemoteList();
+        }
+        if (findFromUser_) {
+            findFromUser_ = false;
+            Message(found_.empty() ? L"No devices found on this network. Make sure the other PC is sharing."
+                                   : L"Found " + std::to_wstring(found_.size()) + L" device(s). Pick one in the list.",
+                    kMuted);
+        }
+    }
+
+    // Saved connections first, then devices found on the network. remoteAddrs_ maps each row to its address.
+    void RefreshRemoteList() {
+        const std::string typed = GetText(IDC_REMOTE);
+        remoteAddrs_.clear();
+        SendMessage(Ctrl(IDC_REMOTE), CB_RESETCONTENT, 0, 0);
+        for (const auto& r : recents_) {
+            remoteAddrs_.push_back(r.addr);
+            SendMessageW(Ctrl(IDC_REMOTE), CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(W(r.addr).c_str()));
+        }
+        for (const auto& d : found_) {
+            const bool saved = std::find_if(recents_.begin(), recents_.end(),
+                                            [&](const Recent& r) { return r.addr == d.ip; }) != recents_.end();
+            if (saved) continue;
+            remoteAddrs_.push_back(d.ip);
+            const std::string label = d.name + "  (" + d.ip + ")";
+            SendMessageW(Ctrl(IDC_REMOTE), CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(W(label).c_str()));
+        }
+        SetText(IDC_REMOTE, W(typed));
     }
 
     // ---- sharing --------------------------------------------------------------------------
@@ -741,8 +803,7 @@ private:
         r.key = psk;
         cfg_->AddRecent(r);
         recents_ = cfg_->Recents();
-        SendMessage(Ctrl(IDC_REMOTE), CB_RESETCONTENT, 0, 0);
-        for (const auto& x : recents_) SendMessageW(Ctrl(IDC_REMOTE), CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(W(x.addr).c_str()));
+        RefreshRemoteList();
         SetText(IDC_REMOTE, W(text));
         Message(L"Connecting... a wrong key simply never connects.", kMuted);
     }
@@ -880,6 +941,8 @@ private:
                 if (w == kTimerUi) {
                     UpdateUi();
                     MaybePromptForApproval();
+                } else if (w == kTimerFind) {
+                    StartFindDevices();
                 } else if (w == kTimerCopied) {
                     KillTimer(h, kTimerCopied);
                     SetText(IDC_COPY_IP, L"Copy");
@@ -1050,14 +1113,25 @@ private:
                         hostCfg_.allowControl = IsDlgButtonChecked(h, IDC_CONTROL) == BST_CHECKED;  // live for this window's host
                         ApplyToService();
                         break;
+                    case IDC_FIND_DEVICES:
+                        StartFindDevices(true);
+                        break;
                     case IDC_REMOTE:
                         if (HIWORD(w) == CBN_SELCHANGE) {
                             LRESULT i = SendMessage(Ctrl(IDC_REMOTE), CB_GETCURSEL, 0, 0);
                             if (i >= 0) FillRemoteKey(size_t(i));
+                            // A found device has no saved key: show just its address; the user types the key.
+                            if (i >= 0 && size_t(i) < remoteAddrs_.size()) SetText(IDC_REMOTE, W(remoteAddrs_[size_t(i)]));
                         }
                         break;
                 }
                 return 0;
+            case kMsgDevices: {
+                std::unique_ptr<std::vector<FoundDevice>> found(reinterpret_cast<std::vector<FoundDevice>*>(l));
+                findBusy_ = false;
+                OnDevicesFound(*found);
+                return 0;
+            }
             case kMsgSvcDone:
                 OnElevatedDone(int(w));
                 return 0;
@@ -1107,6 +1181,10 @@ private:
 
     std::unique_ptr<Config> cfg_;
     std::vector<Recent> recents_;
+    std::vector<FoundDevice> found_;      // hosts that answered the last network search
+    std::vector<std::string> remoteAddrs_;  // address for each row of the remote list, in list order
+    bool findBusy_ = false;               // a search thread is running
+    bool findFromUser_ = false;           // the user pressed "Find devices": report the result
 
     rdh::HostConfig hostCfg_;
     rdh::HostStatus host_;

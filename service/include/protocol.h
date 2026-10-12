@@ -9,6 +9,10 @@ namespace rd {
 
 constexpr uint32_t kMagic = 0x32445352;  // 'RSD2'
 constexpr uint16_t kDefaultPort = 47800;
+// LAN discovery: a plain UDP query to the host port, answered by a host that is sharing with its computer
+// name. Nothing secret is sent in either direction.
+inline constexpr char kDiscoverQuery[4] = {'R', 'D', 'Q', '1'};
+inline constexpr char kDiscoverReply[4] = {'R', 'D', 'A', '1'};
 constexpr size_t kMaxPayload = 1200;
 
 enum class PacketType : uint8_t {

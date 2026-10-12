@@ -38,6 +38,10 @@ add_executable(test-secure tests/test_secure.cpp)
 target_include_directories(test-secure PRIVATE service/include service/src client/src app)
 target_link_libraries(test-secure PRIVATE ${MF_LIBS} user32 gdi32 bcrypt crypt32 iphlpapi comctl32 advapi32 wtsapi32 userenv shell32 secur32)
 
+# Multi-screen layout math (plain C++, no display needed).
+add_executable(test-capture-layout tests/test_capture_layout.cpp)
+target_include_directories(test-capture-layout PRIVATE service/src)
+
 # Virtual monitor EDID (plain C++, no WDK needed).
 add_executable(test-edid tests/test_edid.cpp driver/src/Edid.cpp)
 target_include_directories(test-edid PRIVATE driver/src)

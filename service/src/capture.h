@@ -2,9 +2,13 @@
 // DXGI Desktop Duplication + GPU BGRA->NV12 conversion (D3D11 video processor).
 // Frames never touch system memory: capture -> NV12 texture -> hardware encoder.
 //
+// Every attached screen on the GPU is captured and copied side by side into one desktop-sized texture,
+// so one stream shows all of them. Screens that show the same area (mirrored or cloned) are taken once.
+// The combined picture is scaled down on the GPU when it is larger than the encoder takes (rdcap::kMax*).
+//
 // Three things are kept apart on purpose:
 //  - the device and the conversion pipeline (they must stay alive for the encoder),
-//  - the desktop duplication (it fails while the UAC prompt or lock screen is up, and is re-created after),
+//  - the desktop duplications (they fail while the UAC prompt or lock screen is up, and are re-created after),
 //  - the pictures handed in from the secure-desktop helper (UploadBgra), which need only the device.
 // Everything is built into temporaries and committed only on success, so a failed attempt never leaves
 // the object half-built.
@@ -20,6 +24,7 @@
 #include <string>
 #include <vector>
 
+#include "capture_layout.h"
 #include "protocol.h"
 
 #define CAP_FAIL(what, hr) do { fprintf(stderr, "capture: %s failed (0x%08lx)\n", what, (unsigned long)(hr)); return false; } while (0)
@@ -41,51 +46,40 @@ public:
     // Generation() changes so callers can tell.
     bool ResizeTo(UINT w, UINT h) { return BuildDevice(w, h); }
 
-    // Which output to capture, by GDI name (e.g. \\.\DISPLAY22). Empty = the first attached output.
-    // Takes effect at the next Init() or device build.
+    // Which screen to capture, by GDI name (e.g. \\.\DISPLAY22). Empty = every attached screen on the GPU,
+    // side by side. Takes effect at the next Init() or device build.
     void SetOutputName(const std::wstring& name) { outputName_ = name; }
 
     bool HasDevice() const { return dev_ != nullptr; }
     uint32_t Generation() const { return generation_; }
 
-    // Waits up to timeoutMs for a new desktop frame. Returns the NV12 texture, or nullptr on timeout
-    // (screen unchanged). Sets `lost` if duplication must be re-initialised.
+    // Waits up to timeoutMs for a new picture. Returns the NV12 texture, or nullptr on timeout (nothing
+    // changed). Sets `lost` if duplication must be re-initialised.
     ID3D11Texture2D* Grab(UINT timeoutMs, bool& lost) {
         lost = false;
-        if (!dupl_) {  // no duplication right now (secure desktop up, or never started)
+        if (outs_.empty() || !outs_[0].dupl) {  // no duplication right now (secure desktop up, or never started)
             lost = true;
             return nullptr;
         }
-        DXGI_OUTDUPL_FRAME_INFO info;
-        ComPtr<IDXGIResource> res;
-        HRESULT hr = dupl_->AcquireNextFrame(timeoutMs, &info, &res);
-        if (hr == DXGI_ERROR_WAIT_TIMEOUT) return nullptr;
-        if (FAILED(hr)) {
-            lost = true;
-            return nullptr;
+        const ULONGLONG deadline = GetTickCount64() + timeoutMs;
+        bool changed = false;
+        for (;;) {
+            for (auto& o : outs_) {
+                if (!Acquire(o, changed)) {
+                    lost = true;
+                    return nullptr;
+                }
+            }
+            if (changed || GetTickCount64() >= deadline) break;
+            Sleep(1);
         }
-
-        if (info.PointerShapeBufferSize > 0) ReadPointerShape(info.PointerShapeBufferSize);
-        if (info.LastPresentTime.QuadPart == 0) {  // only the mouse pointer moved: no new picture
-            dupl_->ReleaseFrame();
-            return nullptr;
+        if (!changed) return nullptr;
+        for (const auto& o : outs_)
+            if (!o.tex) return nullptr;  // a screen has not shown a picture yet
+        for (const auto& o : outs_) {  // place each screen's newest picture in the combined desktop
+            ctx_->CopySubresourceRegion(pipe_.bgra.Get(), 0, UINT(o.rect.left - rect_.left), UINT(o.rect.top - rect_.top),
+                                        0, o.tex.Get(), 0, nullptr);
         }
-
-        ComPtr<ID3D11Texture2D> desktop;
-        D3D11_TEXTURE2D_DESC fd = {};
-        if (FAILED(res.As(&desktop))) {
-            dupl_->ReleaseFrame();
-            lost = true;
-            return nullptr;
-        }
-        desktop->GetDesc(&fd);
-        if (fd.Width != pipe_.bw || fd.Height != pipe_.bh) {  // mode changed; rebuild on the next Init()
-            dupl_->ReleaseFrame();
-            lost = true;
-            return nullptr;
-        }
-        ctx_->CopyResource(pipe_.bgra.Get(), desktop.Get());
-        dupl_->ReleaseFrame();
         return Convert(lost);
     }
 
@@ -122,6 +116,7 @@ public:
     }
 
     ID3D11Texture2D* Last() const { return last_; }
+    // The area the captured picture covers, in desktop coordinates (all captured screens together).
     const RECT& desktopRect() const { return rect_; }
 
     // The pointer is not part of the captured picture; its shape is tracked separately so the
@@ -136,15 +131,16 @@ public:
     ID3D11Device* device() const { return dev_.Get(); }
     UINT width() const { return pipe_.ow; }     // NV12 (encoder) size, even
     UINT height() const { return pipe_.oh; }
-    UINT bgraWidth() const { return pipe_.bw; }  // desktop size
+    UINT bgraWidth() const { return pipe_.bw; }  // combined desktop size
     UINT bgraHeight() const { return pipe_.bh; }
+    size_t screenCount() const { return outs_.size(); }  // screens in the combined picture
 
 private:
     // The textures and video processor that turn a BGRA picture into NV12. Built whole or not at all.
     struct Pipe {
-        ComPtr<ID3D11Texture2D> bgra;               // desktop-sized BGRA picture
+        ComPtr<ID3D11Texture2D> bgra;               // combined desktop-sized BGRA picture
         UINT bw = 0, bh = 0;                        // BGRA size
-        UINT ow = 0, oh = 0;                        // NV12 size (even)
+        UINT ow = 0, oh = 0;                        // NV12 size (even, within the encoder limit)
         std::vector<ComPtr<ID3D11Texture2D>> ring;  // NV12 output ring
         ComPtr<ID3D11VideoDevice> vdev;
         ComPtr<ID3D11VideoContext> vctx;
@@ -153,36 +149,50 @@ private:
         ComPtr<ID3D11VideoProcessorInputView> inView;
     };
 
-    // Creates a device on the output's adapter and a pipeline at w x h (0 = desktop size). On success
+    // One attached screen: its duplication, and its newest picture copied into its own texture.
+    struct Output {
+        ComPtr<IDXGIOutput1> out1;
+        RECT rect = {};                           // where the screen sits on the desktop
+        ComPtr<IDXGIOutputDuplication> dupl;      // null until StartDuplication
+        ComPtr<ID3D11Texture2D> tex;              // newest picture of this screen
+    };
+
+    // Creates a device on the adapter with the chosen screens and a pipeline for them. On success
     // everything is replaced at once; any duplication on the old device is dropped.
     bool BuildDevice(UINT forceW, UINT forceH) {
         ComPtr<IDXGIFactory1> factory;
         if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return false;
+
+        // The chosen screens are on the first adapter that has an attached screen (or, for a named
+        // screen, the adapter that has it). Screens on other adapters are not part of the picture.
+        struct Found {
+            ComPtr<IDXGIOutput1> out1;
+            RECT rect;
+        };
+        std::vector<Found> found;
         ComPtr<IDXGIAdapter1> adapter;
-        ComPtr<IDXGIOutput> output;
-        DXGI_OUTPUT_DESC od = {};
-        // The output named by SetOutputName (e.g. \\.\DISPLAY22), else the first attached output. On
-        // hybrid-GPU laptops that is the first adapter with an attached output.
         for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
-            for (UINT j = 0; ; ++j) {
+            for (UINT j = 0;; ++j) {
                 ComPtr<IDXGIOutput> candidate;
                 if (adapter->EnumOutputs(j, &candidate) == DXGI_ERROR_NOT_FOUND) break;
                 DXGI_OUTPUT_DESC cd = {};
                 candidate->GetDesc(&cd);
-                if (outputName_.empty() || outputName_ == cd.DeviceName) {
-                    output = candidate;
-                    od = cd;
-                    break;
-                }
+                if (!cd.AttachedToDesktop) continue;
+                if (!outputName_.empty() && outputName_ != cd.DeviceName) continue;
+                ComPtr<IDXGIOutput1> o1;
+                if (FAILED(candidate.As(&o1))) continue;
+                found.push_back({o1, cd.DesktopCoordinates});
             }
-            if (output) break;
+            if (!found.empty()) break;
             adapter.Reset();
         }
-        if (!adapter || !output) CAP_FAIL("no adapter with an attached output", 0);
-        const RECT rect = od.DesktopCoordinates;
+        if (!adapter || found.empty()) CAP_FAIL("no adapter with an attached output", 0);
 
-        ComPtr<IDXGIOutput1> out1;
-        if (FAILED(output.As(&out1))) return false;
+        std::vector<RECT> rects;
+        for (const auto& f : found) rects.push_back(f.rect);
+        const rdcap::CompositeLayout layout = rdcap::PlanComposite(rects);
+        const RECT desktop = layout.desktop;
+
         ComPtr<ID3D11Device> dev;
         ComPtr<ID3D11DeviceContext> ctx;
         if (HRESULT e = D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
@@ -192,17 +202,26 @@ private:
         ComPtr<ID3D10Multithread> mt;
         if (SUCCEEDED(dev.As(&mt))) mt->SetMultithreadProtected(TRUE);
 
-        const UINT w = forceW ? forceW : UINT(rect.right - rect.left);
-        const UINT h = forceH ? forceH : UINT(rect.bottom - rect.top);
+        const UINT w = forceW ? forceW : UINT(rdcap::RectW(desktop));
+        const UINT h = forceH ? forceH : UINT(rdcap::RectH(desktop));
+        UINT ow = 0, oh = 0;
+        rdcap::FitInside(w, h, rdcap::kMaxEncodeW, rdcap::kMaxEncodeH, ow, oh);
         Pipe p;
-        if (!MakePipe(dev.Get(), ctx.Get(), w, h, p)) return false;
+        if (!MakePipe(dev.Get(), ctx.Get(), w, h, ow, oh, p)) return false;
+
+        std::vector<Output> outs;
+        for (size_t k : layout.keep) {
+            Output o;
+            o.out1 = found[k].out1;
+            o.rect = found[k].rect;
+            outs.push_back(std::move(o));
+        }
 
         // Commit. Nothing above touched the object, so a failure leaves the previous state intact.
-        dupl_.Reset();  // a duplication belongs to the device it was made on
+        outs_ = std::move(outs);  // their duplications belonged to the old device
         dev_ = dev;
         ctx_ = ctx;
-        output1_ = out1;
-        rect_ = rect;
+        rect_ = desktop;
         pipe_ = std::move(p);
         staging_.Reset();
         ringPos_ = 0;
@@ -211,25 +230,92 @@ private:
         return true;
     }
 
-    // Starts duplication on the current device. Returns false, leaving the device alone, if it cannot
-    // (for example while the secure desktop is up). Rebuilds the device if the mode changed.
+    // Starts duplication of every screen on the current device. Returns false, leaving the device alone,
+    // if it cannot (for example while the secure desktop is up). Rebuilds the device if the layout changed.
     bool StartDuplication() {
-        dupl_.Reset();
-        if (!dev_ || !output1_) return false;
-        ComPtr<IDXGIOutputDuplication> d;
-        if (FAILED(output1_->DuplicateOutput(dev_.Get(), &d))) return false;
-        DXGI_OUTDUPL_DESC dd = {};
-        d->GetDesc(&dd);
-        if (dd.ModeDesc.Width != pipe_.bw || dd.ModeDesc.Height != pipe_.bh) {  // resolution changed
-            d.Reset();
-            if (!BuildDevice(dd.ModeDesc.Width, dd.ModeDesc.Height)) return false;
-            if (FAILED(output1_->DuplicateOutput(dev_.Get(), &d))) return false;
+        ResetDuplications();
+        if (!dev_ || outs_.empty()) return false;
+        // The device was last built at another size (the secure desktop's): go back to the desktop's.
+        if (pipe_.bw != UINT(rdcap::RectW(rect_)) || pipe_.bh != UINT(rdcap::RectH(rect_))) {
+            if (!BuildDevice(0, 0)) return false;
         }
-        dupl_ = d;
+        bool modeChanged = false;
+        if (DuplicateAll(modeChanged)) return true;
+        if (!modeChanged) return false;
+        // A screen changed resolution since the device was built: rebuild the layout and try again.
+        ResetDuplications();
+        if (!BuildDevice(0, 0)) return false;
+        return DuplicateAll(modeChanged);
+    }
+
+    // Duplicates every screen in outs_. False if one fails, or if one shows another size than its area.
+    bool DuplicateAll(bool& modeChanged) {
+        for (auto& o : outs_) {
+            ComPtr<IDXGIOutputDuplication> d;
+            if (FAILED(o.out1->DuplicateOutput(dev_.Get(), &d))) return false;
+            DXGI_OUTDUPL_DESC dd = {};
+            d->GetDesc(&dd);
+            if (dd.ModeDesc.Width != UINT(rdcap::RectW(o.rect)) || dd.ModeDesc.Height != UINT(rdcap::RectH(o.rect))) {
+                modeChanged = true;
+                return false;
+            }
+            o.dupl = d;
+        }
         return true;
     }
 
-    bool MakePipe(ID3D11Device* dev, ID3D11DeviceContext* ctx, UINT w, UINT h, Pipe& p) {
+    void ResetDuplications() {
+        for (auto& o : outs_) {
+            o.dupl.Reset();
+            o.tex.Reset();
+        }
+    }
+
+    // Takes the newest picture of one screen into its own texture, if there is a new one. False when
+    // duplication has failed and must be re-initialised. `changed` is set when a picture was taken.
+    bool Acquire(Output& o, bool& changed) {
+        DXGI_OUTDUPL_FRAME_INFO info = {};
+        ComPtr<IDXGIResource> res;
+        const HRESULT hr = o.dupl->AcquireNextFrame(0, &info, &res);
+        if (hr == DXGI_ERROR_WAIT_TIMEOUT) return true;
+        if (FAILED(hr)) return false;
+
+        if (info.PointerShapeBufferSize > 0) ReadPointerShape(o.dupl.Get(), info.PointerShapeBufferSize);
+        // Only the mouse pointer moved (no new picture), or nothing to copy: nothing to do.
+        if (!res || (info.LastPresentTime.QuadPart == 0 && o.tex)) {
+            o.dupl->ReleaseFrame();
+            return true;
+        }
+
+        ComPtr<ID3D11Texture2D> desktop;
+        if (FAILED(res.As(&desktop))) {
+            o.dupl->ReleaseFrame();
+            return false;
+        }
+        D3D11_TEXTURE2D_DESC fd = {};
+        desktop->GetDesc(&fd);
+        if (fd.Width != UINT(rdcap::RectW(o.rect)) || fd.Height != UINT(rdcap::RectH(o.rect))) {  // mode changed
+            o.dupl->ReleaseFrame();
+            return false;
+        }
+        if (!o.tex) {  // same size and format as the screen, for the copy
+            D3D11_TEXTURE2D_DESC td = fd;
+            td.Usage = D3D11_USAGE_DEFAULT;
+            td.BindFlags = 0;
+            td.CPUAccessFlags = 0;
+            td.MiscFlags = 0;
+            if (FAILED(dev_->CreateTexture2D(&td, nullptr, &o.tex))) {
+                o.dupl->ReleaseFrame();
+                return false;
+            }
+        }
+        ctx_->CopyResource(o.tex.Get(), desktop.Get());
+        o.dupl->ReleaseFrame();
+        changed = true;
+        return true;
+    }
+
+    bool MakePipe(ID3D11Device* dev, ID3D11DeviceContext* ctx, UINT w, UINT h, UINT ow, UINT oh, Pipe& p) {
         D3D11_TEXTURE2D_DESC td = {};
         td.Width = w;
         td.Height = h;
@@ -241,8 +327,15 @@ private:
         if (HRESULT e = dev->CreateTexture2D(&td, nullptr, &p.bgra); FAILED(e)) CAP_FAIL("create BGRA texture", e);
         p.bw = w;
         p.bh = h;
-        p.ow = w & ~1u;  // NV12 needs even dimensions
-        p.oh = h & ~1u;
+        p.ow = ow;  // NV12 needs even dimensions; rdcap::FitInside gives them
+        p.oh = oh;
+
+        // Black until the screens are copied in: an uncovered gap (a layout with holes) shows as black.
+        ComPtr<ID3D11RenderTargetView> rtv;
+        if (SUCCEEDED(dev->CreateRenderTargetView(p.bgra.Get(), nullptr, &rtv))) {
+            const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+            ctx->ClearRenderTargetView(rtv.Get(), black);
+        }
 
         td.Width = p.ow;
         td.Height = p.oh;
@@ -307,11 +400,11 @@ private:
     }
 
     // The pointer is not part of the captured picture; its shape is tracked separately.
-    void ReadPointerShape(UINT size) {
+    void ReadPointerShape(IDXGIOutputDuplication* dupl, UINT size) {
         std::vector<uint8_t> buf(size);
         UINT required = 0;
         DXGI_OUTDUPL_POINTER_SHAPE_INFO si = {};
-        if (FAILED(dupl_->GetFramePointerShape(size, buf.data(), &required, &si))) return;
+        if (FAILED(dupl->GetFramePointerShape(size, buf.data(), &required, &si))) return;
         const UINT w = si.Width;
         UINT h = si.Height;
         if (si.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME) h /= 2;  // AND mask above XOR mask
@@ -347,8 +440,7 @@ private:
 
     ComPtr<ID3D11Device> dev_;
     ComPtr<ID3D11DeviceContext> ctx_;
-    ComPtr<IDXGIOutput1> output1_;
-    ComPtr<IDXGIOutputDuplication> dupl_;
+    std::vector<Output> outs_;
     ComPtr<ID3D11Texture2D> staging_;
     Pipe pipe_;
     size_t ringPos_ = 0;
