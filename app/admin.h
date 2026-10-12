@@ -171,6 +171,26 @@ inline int AdminControl(const std::wstring& verbs, const std::wstring& user) {
             std::wstring e;
             ok = RemoveVirtualMonitor(e);
             if (!ok) Log(log, "vm-remove: %ls", e.c_str());
+        } else if (v == L"driver-install") {  // installer: the driver package shipped next to this program
+            const std::wstring self = SelfPath();
+            const std::wstring inf = self.substr(0, self.find_last_of(L'\\')) + L"\\driver\\RemoteDisplayVirtual.inf";
+            std::string out = RunCapture(L"pnputil /add-driver \"" + inf + L"\" /install");
+            ok = out.find("successfully") != std::string::npos;
+            if (!ok) Log(log, "driver-install: pnputil failed: %s", out.c_str());
+            if (ok && !HasVirtualMonitorDevice()) {
+                std::wstring e;
+                bool reboot = false;
+                ok = AddVirtualMonitor(inf, e, reboot);
+                if (!ok) Log(log, "driver-install: %ls", e.c_str());
+                if (ok && reboot) Log(log, "driver-install: a restart is needed before the virtual monitor appears");
+            }
+        } else if (v == L"driver-purge") {  // uninstall: remove the device and every driver package of it
+            std::wstring e;
+            bool failed = false;
+            ok = RemoveVirtualMonitor(e);
+            const int n = RemoveDriverPackages(failed);
+            ok = ok && !failed;
+            Log(log, "driver-purge: %d package(s) removed%s", n, failed ? " (one could not be removed)" : "");
         }
         Log(log, "admin-ctl %ls: %s", v.c_str(), ok ? "ok" : "FAILED");
         if (!ok) rc = 20;

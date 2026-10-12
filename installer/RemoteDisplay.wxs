@@ -1,0 +1,108 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  RemoteDisplay installer (WiX 3.14 schema; built by Build-Installer.ps1 with candle and light).
+
+  Installs, per machine:
+    - RemoteDisplay.exe (the app, the background service and the admin helper: one program)
+    - the virtual monitor driver package (driver\): added to the driver store, then the device is created
+    - the Windows service (RemoteDisplayHost) and its firewall rule
+    - a Start menu shortcut and an Add/Remove Programs entry
+
+  Uninstall removes all of it: the service, the virtual monitor device, every driver package of it,
+  and the files. Settings in %APPDATA%\RemoteDisplay are left alone.
+
+  Install and removal steps run as deferred custom actions (as SYSTEM) through RemoteDisplay.exe's admin
+  commands. They use no paths, so they work from wherever the program is installed.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*"
+           Name="RemoteDisplay"
+           Language="1033"
+           Version="1.0.0.0"
+           Manufacturer="RemoteDisplay"
+           UpgradeCode="6F1B4A3E-2C7D-4E8A-9B51-3D0C7A92E415">
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" Description="RemoteDisplay installer" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of RemoteDisplay is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Feature Id="Main" Title="RemoteDisplay" Level="1">
+      <ComponentGroupRef Id="ProgramFiles" />
+      <ComponentGroupRef Id="DriverFiles" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLFOLDER" Name="RemoteDisplay">
+          <Directory Id="DRIVERFOLDER" Name="driver" />
+        </Directory>
+      </Directory>
+      <Directory Id="ProgramMenuFolder">
+        <Component Id="StartMenuShortcut" Guid="0B7E3C52-9A41-4F6D-8E27-5C1D9F0A6B38">
+          <Shortcut Id="RemoteDisplayShortcut"
+                    Name="RemoteDisplay"
+                    Description="Remote desktop and screen sharing"
+                    Target="[INSTALLFOLDER]RemoteDisplay.exe"
+                    WorkingDirectory="INSTALLFOLDER" />
+          <RegistryValue Root="HKCU" Key="Software\RemoteDisplay" Name="ShortcutInstalled" Type="integer" Value="1" KeyPath="yes" />
+        </Component>
+      </Directory>
+    </Directory>
+
+    <!-- Program: installed from the staged build output. -->
+    <ComponentGroup Id="ProgramFiles" Directory="INSTALLFOLDER">
+      <Component Id="RemoteDisplayExeComponent" Guid="2D8F5A17-6B3C-4E90-A1D4-7F2E8C0B9A65">
+        <File Id="RemoteDisplayExe" Source="$(var.StageDir)\RemoteDisplay.exe" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- Driver package: copied next to the program; the install step adds it to the driver store. -->
+    <ComponentGroup Id="DriverFiles" Directory="DRIVERFOLDER">
+      <Component Id="DriverInfComponent" Guid="5C1A9E42-0D7B-4B8F-9E63-A2F4C18D7B01">
+        <File Id="DriverInf" Source="$(var.StageDir)\driver\RemoteDisplayVirtual.inf" KeyPath="yes" />
+      </Component>
+      <Component Id="DriverCatComponent" Guid="8E4B2D70-3F15-4C9A-B6E8-91D0A5C2F374">
+        <File Id="DriverCat" Source="$(var.StageDir)\driver\RemoteDisplayVirtual.cat" KeyPath="yes" />
+      </Component>
+      <Component Id="DriverDllComponent" Guid="A3F7C6B1-94E2-4D08-8B5A-6C1E0F2D9B46">
+        <File Id="DriverDll" Source="$(var.StageDir)\driver\RemoteDisplayVirtual.dll" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- Install steps, after the files are in place, as SYSTEM. A driver problem is logged, not fatal, so the
+         app still installs. The service step must succeed. -->
+    <CustomAction Id="CA_DriverInstall"
+                  FileKey="RemoteDisplayExe"
+                  ExeCommand="--admin-ctl driver-install"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+    <CustomAction Id="CA_ServiceInstall"
+                  FileKey="RemoteDisplayExe"
+                  ExeCommand="--service-ctl install"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check" />
+
+    <!-- Removal steps, before the files are deleted. -->
+    <CustomAction Id="CA_ServiceUninstall"
+                  FileKey="RemoteDisplayExe"
+                  ExeCommand="--service-ctl uninstall"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+    <CustomAction Id="CA_DriverPurge"
+                  FileKey="RemoteDisplayExe"
+                  ExeCommand="--admin-ctl driver-purge"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="CA_DriverInstall" After="InstallFiles">NOT REMOVE</Custom>
+      <Custom Action="CA_ServiceInstall" After="CA_DriverInstall">NOT REMOVE</Custom>
+      <Custom Action="CA_ServiceUninstall" Before="RemoveFiles">REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE</Custom>
+      <Custom Action="CA_DriverPurge" Before="RemoveFiles">REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE</Custom>
+    </InstallExecuteSequence>
+  </Product>
+</Wix>

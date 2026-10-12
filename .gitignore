@@ -3,3 +3,6 @@ build/
 *.aps
 .vs/
 driver/out/
+installer/out/
+installer/obj/
+installer/stage/

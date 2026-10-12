@@ -96,6 +96,17 @@ inline bool HasVirtualMonitorHwId(HDEVINFO set, SP_DEVINFO_DATA& dev) {
     return false;
 }
 
+// True if a virtual monitor device already exists (so an install or repair does not add a second one).
+inline bool HasVirtualMonitorDevice() {
+    HDEVINFO set = SetupDiGetClassDevsW(&DisplayClassGuid(), nullptr, nullptr, 0);
+    if (set == INVALID_HANDLE_VALUE) return false;
+    bool found = false;
+    SP_DEVINFO_DATA dev = {sizeof(dev)};
+    for (DWORD i = 0; !found && SetupDiEnumDeviceInfo(set, i, &dev); ++i) found = HasVirtualMonitorHwId(set, dev);
+    SetupDiDestroyDeviceInfoList(set);
+    return found;
+}
+
 // Removes every virtual monitor device. Returns true if none is left (also when none existed).
 inline bool RemoveVirtualMonitor(std::wstring& err) {
     HDEVINFO set = SetupDiGetClassDevsW(&DisplayClassGuid(), nullptr, nullptr, 0);
@@ -150,6 +161,69 @@ inline std::wstring FindVirtualMonitorDisplay() {
         return source.viewGdiDeviceName;
     }
     return L"";
+}
+
+// Runs a command with no window and returns its standard output.
+inline std::string RunCapture(const std::wstring& command) {
+    SECURITY_ATTRIBUTES sa = {sizeof(sa), nullptr, TRUE};
+    HANDLE readPipe = nullptr, writePipe = nullptr;
+    if (!CreatePipe(&readPipe, &writePipe, &sa, 0)) return "";
+    SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0);
+    STARTUPINFOW si = {sizeof(si)};
+    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    si.hStdOutput = writePipe;
+    si.hStdError = writePipe;
+    PROCESS_INFORMATION pi = {};
+    std::wstring cmd = command;
+    const BOOL ok = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    CloseHandle(writePipe);
+    std::string out;
+    if (ok) {
+        char buf[4096];
+        DWORD n = 0;
+        while (ReadFile(readPipe, buf, sizeof(buf), &n, nullptr) && n) out.append(buf, n);
+        WaitForSingleObject(pi.hProcess, 60000);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+    CloseHandle(readPipe);
+    return out;
+}
+
+// Deletes every driver-store package of the virtual monitor (all versions), so an uninstall leaves nothing
+// behind. Returns the number of packages removed; `failed` is set if one could not be removed.
+inline int RemoveDriverPackages(bool& failed) {
+    failed = false;
+    int removed = 0;
+    const std::string text = RunCapture(L"pnputil /enum-drivers");
+    // pnputil prints one block per package: "Published Name:  oemN.inf" then "Original Name:  <name>".
+    size_t pos = 0;
+    std::string published;
+    while (pos < text.size()) {
+        size_t eol = text.find('\n', pos);
+        if (eol == std::string::npos) eol = text.size();
+        std::string line = text.substr(pos, eol - pos);
+        pos = eol + 1;
+        const auto valueOf = [](const std::string& l) {
+            const size_t colon = l.find(':');
+            if (colon == std::string::npos) return std::string();
+            std::string v = l.substr(colon + 1);
+            const size_t first = v.find_first_not_of(" \t\r");
+            const size_t last = v.find_last_not_of(" \t\r");
+            return first == std::string::npos ? std::string() : v.substr(first, last - first + 1);
+        };
+        if (line.find("Published Name") != std::string::npos) published = valueOf(line);
+        if (line.find("Original Name") != std::string::npos) {
+            std::string original = valueOf(line);
+            for (auto& c : original) c = char(tolower(c));
+            if (original == "remotedisplayvirtual.inf" && !published.empty()) {
+                const std::string out = RunCapture(L"pnputil /delete-driver " + std::wstring(published.begin(), published.end()) + L" /uninstall /force");
+                if (out.find("deleted successfully") != std::string::npos) ++removed; else failed = true;
+            }
+        }
+    }
+    return removed;
 }
 
 }  // namespace rdapp
