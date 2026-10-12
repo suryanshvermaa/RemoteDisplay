@@ -25,6 +25,8 @@ enum class PacketType : uint8_t {
 enum PacketFlags : uint8_t {
     kFlagKeyframe = 1,
     kFlagControlAllowed = 2,  // on host keepalives: the user allows mouse/keyboard control
+    kFlagAwaitingApproval = 4,  // on host keepalives: the connection waits for the user to allow it
+    kFlagDenied = 8,            // on host keepalives: the user refused this connection
 };
 
 #pragma pack(push, 1)

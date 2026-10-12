@@ -270,6 +270,18 @@ inline void RunHost(const HostConfig& cfg, std::atomic<bool>& stop, HostStatus& 
         st.SetPeer("");
     };
 
+    // Sends one encrypted keepalive carrying status flags (see kFlagAwaitingApproval / kFlagDenied).
+    auto sendHelloFlags = [&](uint8_t flags) {
+        if (!peer.valid || !active.valid()) return;
+        rd::PacketHeader kh = {};
+        kh.magic = rd::kMagic;
+        kh.type = uint8_t(rd::PacketType::Hello);
+        kh.flags = flags;
+        uint8_t kw[sizeof(rd::WireHeader) + sizeof(kh) + rd::kTagLen];
+        const size_t kn = active.Seal(reinterpret_cast<uint8_t*>(&kh), sizeof(kh), kw);
+        if (kn) sendto(sock.s, reinterpret_cast<char*>(kw), int(kn), 0, reinterpret_cast<const sockaddr*>(&peer.addr), sizeof(peer.addr));
+    };
+
     while (!stop) {
         // --- UI commands -------------------------------------------------------------------
         if (st.kick.exchange(false)) dropClient(10'000);  // refuse re-pairing for 10 s
@@ -280,6 +292,8 @@ inline void RunHost(const HostConfig& cfg, std::atomic<bool>& stop, HostStatus& 
                 if (st.remember.exchange(false) && haveDev && cfg.trust) cfg.trust->Remember(peerDev, peerName);
                 forceKey = true;
             } else if (st.deny.exchange(false)) {
+                // Tell the viewer why it is being dropped (sent a few times: UDP can lose packets).
+                for (int i = 0; i < 3; ++i) sendHelloFlags(uint8_t(rd::kFlagDenied));
                 dropClient(30'000);
             }
         }
@@ -417,14 +431,8 @@ inline void RunHost(const HostConfig& cfg, std::atomic<bool>& stop, HostStatus& 
         // Keepalive: a static screen (or a pending approval) sends no video, and the client treats
         // 3 s of silence as "host gone". Tiny encrypted packet once a second.
         if (peer.valid && active.valid() && NowUs() - lastKeepalive > 1'000'000) {
-            rd::PacketHeader kh = {};
-            kh.magic = rd::kMagic;
-            kh.type = uint8_t(rd::PacketType::Hello);
-            kh.flags = cfg.allowControl ? uint8_t(rd::kFlagControlAllowed) : uint8_t(0);
-            uint8_t kw[sizeof(rd::WireHeader) + sizeof(kh) + rd::kTagLen];
-            size_t kn = active.Seal(reinterpret_cast<uint8_t*>(&kh), sizeof(kh), kw);
-            if (kn) sendto(sock.s, reinterpret_cast<char*>(kw), int(kn), 0,
-                           reinterpret_cast<const sockaddr*>(&peer.addr), sizeof(peer.addr));
+            sendHelloFlags(uint8_t((cfg.allowControl ? rd::kFlagControlAllowed : 0) |
+                                   (st.state == HostStatus::AwaitingApproval ? rd::kFlagAwaitingApproval : 0)));
             lastKeepalive = NowUs();
         }
 

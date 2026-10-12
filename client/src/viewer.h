@@ -528,6 +528,15 @@ inline void Worker(Viewer* v, std::string hostIp, int port, std::array<uint8_t, 
     uint8_t hs1Wire[sizeof(rd::WireHeader) + rd::kHs1Len];
     bool connected = false;
     uint64_t lastHs = 0, lastRx = NowUs(), lastIdent = 0;
+    // What the window title says. Only the status changes, so the title is not rewritten every loop.
+    const uint64_t startUs = NowUs();
+    bool hostSeen = false;  // some handshake answer came back: the device exists and is reachable
+    std::string lastStatus;
+    auto setStatus = [&](const std::string& s) {
+        if (s == lastStatus) return;
+        lastStatus = s;
+        v->SetTitle(base + "  -  " + s);
+    };
     bool gotHostData = false;  // the host answered after we connected: it has seen our Identify
 
     auto sendCtrl = [&](rd::PacketType t) {
@@ -613,7 +622,11 @@ inline void Worker(Viewer* v, std::string hostIp, int port, std::array<uint8_t, 
             haveCur = false;
             needKey = true;
             resetInput();
-            v->SetTitle(base + "  -  reconnecting...");
+            hostSeen = false;
+            setStatus("reconnecting...");
+        }
+        if (!connected && !hostSeen && NowUs() - startUs > 8'000'000) {
+            setStatus("device not found: no answer from " + hostIp + " (check the address, that RemoteDisplay is sharing there, and the firewall)");
         }
         if (!connected && NowUs() - lastHs > 300'000) {
             if (!hs) {  // new ephemeral keys; retransmit the SAME Hs1 until Hs2 arrives
@@ -642,8 +655,13 @@ inline void Worker(Viewer* v, std::string hostIp, int port, std::array<uint8_t, 
         memcpy(&wh, wirebuf, sizeof(wh));
         if (wh.magic != rd::kWireMagic) continue;
         if (wh.type == uint8_t(rd::WireType::Hs2)) {
-            if (!connected && hs && wn == int(sizeof(wh) + rd::kHs2Len) &&
-                hs->Finish(psk.data(), wirebuf + sizeof(wh), sess)) {
+            if (!connected && hs && wn == int(sizeof(wh) + rd::kHs2Len)) {
+                hostSeen = true;
+                if (!hs->Finish(psk.data(), wirebuf + sizeof(wh), sess)) {
+                    // The host answered, but could not prove it knows this pairing key.
+                    setStatus("pairing key is incorrect: the device was found, but this key does not match it");
+                    continue;
+                }
                 connected = true;
                 lastRx = NowUs();
                 gotHostData = false;
@@ -656,7 +674,7 @@ inline void Worker(Viewer* v, std::string hostIp, int port, std::array<uint8_t, 
                 lastHello = NowUs();
                 needKey = true;
                 resetInput();
-                v->SetTitle(base + "  -  connected");
+                setStatus("connected");
             }
             continue;
         }
@@ -672,10 +690,10 @@ inline void Worker(Viewer* v, std::string hostIp, int port, std::array<uint8_t, 
         if (h.magic != rd::kMagic) continue;
         if (h.type == uint8_t(rd::PacketType::Hello)) {  // host keepalive, carries what the user allows
             const bool allowed = (h.flags & rd::kFlagControlAllowed) != 0;
-            if (allowed != v->controlAllowed) {
-                v->controlAllowed = allowed;
-                v->SetTitle(base + (allowed ? "  -  connected, remote control on" : "  -  connected, view only"));
-            }
+            v->controlAllowed = allowed;
+            if (h.flags & rd::kFlagDenied) setStatus("refused by the other PC");
+            else if (h.flags & rd::kFlagAwaitingApproval) setStatus("waiting for approval on the other PC");
+            else setStatus(allowed ? "connected, remote control on" : "connected, view only");
             continue;
         }
         if (h.type == uint8_t(rd::PacketType::InputAck)) {
