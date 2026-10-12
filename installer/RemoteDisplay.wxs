@@ -18,7 +18,7 @@
   <Product Id="*"
            Name="RemoteDisplay"
            Language="1033"
-           Version="1.0.0.0"
+           Version="1.0.0.1"
            Manufacturer="RemoteDisplay"
            UpgradeCode="6F1B4A3E-2C7D-4E8A-9B51-3D0C7A92E415">
     <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" Description="RemoteDisplay installer" />
