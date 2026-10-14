@@ -55,9 +55,12 @@ int main() {
     }
 
     // ---- the machine-wide switch cannot be flipped without admin rights
+    // The flag may already be on: the app's own "Run as administrator" setting writes it. The test does not
+    // change it; it checks that normal rights cannot change it.
     if (!IsElevated()) {
+        const bool before = GetElevateWorker();
         CHECK(!SetElevateWorker(true), "normal rights cannot set the machine-wide elevation flag");
-        CHECK(!GetElevateWorker(), "and the flag is still off");
+        CHECK(GetElevateWorker() == before, "and the flag is left as it was");
     } else {
         printf("SKIP flag test: running elevated, not touching HKLM\n");
     }

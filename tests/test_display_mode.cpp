@@ -32,6 +32,11 @@ int main(int argc, char** argv) {
     }
     const int start = CountActiveMonitors();
     printf("layout before: %d active display(s), %u path(s)\n", start, UINT(before.paths.size()));
+    if (start < 2) {
+        // Duplicate and Extend need a second display (the virtual monitor, or a real one).
+        printf("SKIP: needs two active displays; there is %d\n", start);
+        return 0;
+    }
 
     int fails = 0;
     if (!ApplyDuplicate()) { printf("FAIL: Duplicate was refused\n"); ++fails; }

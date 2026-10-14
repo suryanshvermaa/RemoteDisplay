@@ -18,7 +18,7 @@
   <Product Id="*"
            Name="RemoteDisplay"
            Language="1033"
-           Version="1.0.0.3"
+           Version="1.0.0.4"
            Manufacturer="RemoteDisplay"
            UpgradeCode="6F1B4A3E-2C7D-4E8A-9B51-3D0C7A92E415">
     <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" Description="RemoteDisplay installer" />
@@ -27,8 +27,16 @@
 
     <Feature Id="Main" Title="RemoteDisplay" Level="1">
       <ComponentGroupRef Id="ProgramFiles" />
-      <ComponentGroupRef Id="DriverFiles" />
       <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+
+    <!-- Off by default: the app installs without any driver. Choose it with
+         msiexec /i RemoteDisplaySetup.msi ADDLOCAL=Main,VirtualMonitor
+         and remove only it, keeping the app, with
+         msiexec /i RemoteDisplaySetup.msi REMOVE=VirtualMonitor -->
+    <Feature Id="VirtualMonitor" Title="Virtual monitor driver (optional)"
+             Description="Adds the RemoteDisplay virtual monitor, a second screen for sharing." Level="0">
+      <ComponentGroupRef Id="DriverFiles" />
     </Feature>
 
     <Directory Id="TARGETDIR" Name="SourceDir">
@@ -99,10 +107,12 @@
                   Return="ignore" />
 
     <InstallExecuteSequence>
-      <Custom Action="CA_DriverInstall" After="InstallFiles">NOT REMOVE</Custom>
+      <!-- The driver is installed only when its optional feature is selected (&amp;: will be installed). -->
+      <Custom Action="CA_DriverInstall" After="InstallFiles">&amp;VirtualMonitor=3 AND NOT REMOVE</Custom>
       <Custom Action="CA_ServiceInstall" After="CA_DriverInstall">NOT REMOVE</Custom>
       <Custom Action="CA_ServiceUninstall" Before="RemoveFiles">REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE</Custom>
-      <Custom Action="CA_DriverPurge" Before="RemoveFiles">REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE</Custom>
+      <!-- The driver is removed when the whole product is removed, or when only its feature is removed. -->
+      <Custom Action="CA_DriverPurge" Before="RemoveFiles">NOT UPGRADINGPRODUCTCODE AND ((&amp;VirtualMonitor=2 AND !VirtualMonitor=3) OR REMOVE="ALL")</Custom>
     </InstallExecuteSequence>
   </Product>
 </Wix>

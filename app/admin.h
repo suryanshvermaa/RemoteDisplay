@@ -174,9 +174,15 @@ inline int AdminControl(const std::wstring& verbs, const std::wstring& user) {
         } else if (v == L"driver-install") {  // installer: the driver package shipped next to this program
             const std::wstring self = SelfPath();
             const std::wstring inf = self.substr(0, self.find_last_of(L'\\')) + L"\\driver\\RemoteDisplayVirtual.inf";
-            std::string out = RunCapture(L"pnputil /add-driver \"" + inf + L"\" /install");
-            ok = out.find("successfully") != std::string::npos;
-            if (!ok) Log(log, "driver-install: pnputil failed: %s", out.c_str());
+            // Already in the driver store at this version (an earlier install or repair): do not add it again.
+            if (DriverPackageInStore("remotedisplayvirtual.inf", InfDriverVersion(inf))) {
+                ok = true;
+                Log(log, "driver-install: this driver version is already in the driver store; not adding it again");
+            } else {
+                std::string out = RunCapture(L"pnputil /add-driver \"" + inf + L"\" /install");
+                ok = out.find("successfully") != std::string::npos;
+                if (!ok) Log(log, "driver-install: pnputil failed: %s", out.c_str());
+            }
             if (ok && !HasVirtualMonitorDevice()) {
                 std::wstring e;
                 bool reboot = false;

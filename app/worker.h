@@ -4,6 +4,8 @@
 // capture is impossible from Session 0), as that user. It shares the screen using the same saved
 // pairing key as the GUI, shows the "Allow this connection?" prompt on the user's desktop, and
 // publishes its status for the GUI through shared.h.
+#include <shellapi.h>
+
 #include <atomic>
 #include <thread>
 
@@ -14,6 +16,34 @@
 #include "shared.h"
 #include "virtual_monitor.h"
 #include "display_mode.h"
+
+namespace rdapp {
+
+// Test options for running the worker by hand (the service starts it without them):
+//   --port <n>      listen on another UDP port (e.g. when the installed service holds 47800)
+//   --key <key>    use this pairing key instead of the saved one
+//   --no-approval  do not show the "Allow this connection?" prompt
+inline void ApplyWorkerTestOptions(rdh::HostConfig& hc) {
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (!argv) return;
+    for (int i = 1; i < argc; ++i) {
+        const std::wstring a = argv[i];
+        if (a == L"--no-approval") {
+            hc.requireApproval = false;
+        } else if (a == L"--port" && i + 1 < argc) {
+            hc.port = _wtoi(argv[++i]);
+        } else if (a == L"--key" && i + 1 < argc) {
+            std::string text;  // keys are plain ASCII
+            for (const wchar_t* p = argv[++i]; *p; ++p) text += char(*p);
+            std::array<uint8_t, rd::kKeyLen> k{};
+            if (rd::ParseKey(text, k.data())) hc.psk = k;
+        }
+    }
+    LocalFree(argv);
+}
+
+}  // namespace rdapp
 
 namespace rdapp {
 
@@ -37,7 +67,11 @@ inline int RunWorker() {
     hc.listenIp = "0.0.0.0";
     hc.psk = cfg.HostKey();
     hc.requireApproval = cfg.RequireApproval();
+    ApplyWorkerTestOptions(hc);
     hc.allowControl = cfg.AllowControl();
+    // [host] capture = auto | dxgi | gdi (auto: GDI when the GPU has no Direct3D 11, e.g. the KMDOD driver).
+    const std::string capture = cfg.Get(L"host", L"capture");
+    if (!capture.empty()) hc.capture = capture;
     // Duplicate or Extend while sharing. A layout left by a worker that was killed is put back first.
     DisplayModeSession displaySession;
     DisplayModeSession::RecoverIfNeeded();

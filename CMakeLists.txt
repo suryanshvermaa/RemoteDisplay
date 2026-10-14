@@ -15,6 +15,10 @@ target_link_libraries(rd-host PRIVATE ${MF_LIBS} bcrypt crypt32 iphlpapi comctl3
 add_executable(rd-client WIN32 client/src/main.cpp)
 target_include_directories(rd-client PRIVATE service/include app)  # shared protocol.h, common.h
 target_link_libraries(rd-client PRIVATE ${MF_LIBS} user32 bcrypt crypt32 iphlpapi comctl32)
+# The client is shipped on its own (installer\Client.wxs): RemoteDisplayClient.exe with the C++ runtime built in,
+# so it runs on a PC that has no Visual C++ runtime and no RemoteDisplay host.
+set_target_properties(rd-client PROPERTIES OUTPUT_NAME RemoteDisplayClient)
+set_property(TARGET rd-client PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
 
 add_executable(test-session tests/test_session.cpp)
 target_include_directories(test-session PRIVATE service/include)
@@ -41,6 +45,16 @@ target_link_libraries(test-secure PRIVATE ${MF_LIBS} user32 gdi32 bcrypt crypt32
 # Multi-screen layout math (plain C++, no display needed).
 add_executable(test-capture-layout tests/test_capture_layout.cpp)
 target_include_directories(test-capture-layout PRIVATE service/src)
+
+# Driver-store check used by the installer (parsing only; no driver is changed).
+add_executable(test-driver-store tests/test_driver_store.cpp)
+target_include_directories(test-driver-store PRIVATE app)
+target_link_libraries(test-driver-store PRIVATE user32 setupapi newdev)
+
+# GDI capture path: BGRA->NV12, GDI screen grab, software H.264 encoder (needs a desktop session).
+add_executable(test-gdi-path tests/test_gdi_path.cpp)
+target_include_directories(test-gdi-path PRIVATE service/include service/src)
+target_link_libraries(test-gdi-path PRIVATE ${MF_LIBS} user32 gdi32)
 
 # Virtual monitor EDID (plain C++, no WDK needed).
 add_executable(test-edid tests/test_edid.cpp driver/src/Edid.cpp)

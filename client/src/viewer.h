@@ -475,16 +475,188 @@ inline HCURSOR MakeCursor(const uint8_t* blob, size_t n) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Software path, for a PC whose GPU has no Direct3D 11 (for example while a display-only driver owns it).
+// Microsoft's software H.264 decoder writes NV12 into system memory; GDI draws it. Slower than the GPU path,
+// but the picture still shows.
+class SoftDecoder {
+public:
+    bool Init() {
+        if (FAILED(CoCreateInstance(CLSID_CMSH264DecoderMFT, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&mft_))))
+            return false;
+        ComPtr<IMFAttributes> a;
+        if (SUCCEEDED(mft_->GetAttributes(&a)) && a) a->SetUINT32(MF_LOW_LATENCY, TRUE);
+        ComPtr<IMFMediaType> it;
+        MFCreateMediaType(&it);
+        it->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+        it->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
+        it->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+        if (FAILED(mft_->SetInputType(0, it.Get(), 0))) return false;
+        PickOutputType();  // may only succeed once the first packet has arrived; Decode retries
+        mft_->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+        mft_->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+        return true;
+    }
+
+    // One access unit in. Returns true with the newest NV12 picture (w x h, tightly packed) in `nv12`.
+    bool Decode(const uint8_t* data, size_t len, std::vector<uint8_t>& nv12, UINT& w, UINT& h) {
+        ComPtr<IMFMediaBuffer> mb;
+        if (FAILED(MFCreateMemoryBuffer(DWORD(len), &mb))) return false;
+        BYTE* p = nullptr;
+        mb->Lock(&p, nullptr, nullptr);
+        memcpy(p, data, len);
+        mb->Unlock();
+        mb->SetCurrentLength(DWORD(len));
+        ComPtr<IMFSample> s;
+        MFCreateSample(&s);
+        s->AddBuffer(mb.Get());
+        s->SetSampleTime(t_);
+        t_ += 166667;
+        HRESULT ir = mft_->ProcessInput(0, s.Get(), 0);
+        if (ir == MF_E_NOTACCEPTING) {  // pictures are waiting: take them, then offer the packet again
+            Drain(nv12, w, h);
+            ir = mft_->ProcessInput(0, s.Get(), 0);
+        }
+        if (FAILED(ir)) return false;
+        return Drain(nv12, w, h);
+    }
+
+private:
+    // Takes every picture the decoder has ready. True if at least one came back (the last one is kept).
+    bool Drain(std::vector<uint8_t>& nv12, UINT& w, UINT& h) {
+        bool got = false;
+        for (int guard = 0; guard < 16; ++guard) {
+            if (!ready_ && !PickOutputType()) break;
+            ComPtr<IMFMediaBuffer> buf;
+            if (FAILED(MFCreateMemoryBuffer(outBytes_, &buf))) break;
+            ComPtr<IMFSample> own;
+            MFCreateSample(&own);
+            own->AddBuffer(buf.Get());
+            MFT_OUTPUT_DATA_BUFFER ob = {};
+            ob.pSample = own.Get();
+            DWORD status = 0;
+            const HRESULT hr = mft_->ProcessOutput(0, 1, &ob, &status);
+            if (ob.pEvents) ob.pEvents->Release();
+            if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {  // the picture size changed: pick the new output type
+                ready_ = false;
+                continue;
+            }
+            if (FAILED(hr)) break;  // MF_E_TRANSFORM_NEED_MORE_INPUT
+            if (CopyNv12(buf.Get(), nv12)) {
+                w = w_;
+                h = h_;
+                got = true;
+            }
+        }
+        return got;
+    }
+
+    bool PickOutputType() {
+        for (DWORD i = 0;; ++i) {
+            ComPtr<IMFMediaType> t;
+            if (FAILED(mft_->GetOutputAvailableType(0, i, &t))) return false;
+            GUID sub = {};
+            t->GetGUID(MF_MT_SUBTYPE, &sub);
+            if (sub != MFVideoFormat_NV12) continue;
+            if (FAILED(mft_->SetOutputType(0, t.Get(), 0))) return false;
+            MFGetAttributeSize(t.Get(), MF_MT_FRAME_SIZE, &w_, &h_);
+            UINT32 stride = 0;
+            stride_ = SUCCEEDED(t->GetUINT32(MF_MT_DEFAULT_STRIDE, &stride)) && stride >= w_ ? stride : w_;
+            MFT_OUTPUT_STREAM_INFO si = {};
+            mft_->GetOutputStreamInfo(0, &si);
+            outBytes_ = si.cbSize ? si.cbSize : DWORD(stride_) * h_ * 2;
+            ready_ = true;
+            return true;
+        }
+    }
+
+    // NV12 with the decoder's row stride -> tightly packed NV12.
+    bool CopyNv12(IMFMediaBuffer* buf, std::vector<uint8_t>& out) {
+        BYTE* p = nullptr;
+        DWORD n = 0;
+        if (FAILED(buf->Lock(&p, nullptr, &n))) return false;
+        const size_t w = w_, h = h_, stride = stride_;
+        out.resize(w * h * 3 / 2);
+        for (size_t row = 0; row < h; ++row) memcpy(&out[row * w], p + row * stride, w);
+        for (size_t row = 0; row < h / 2; ++row) memcpy(&out[w * h + row * w], p + stride * h + row * stride, w);
+        buf->Unlock();
+        return true;
+    }
+
+    ComPtr<IMFTransform> mft_;
+    bool ready_ = false;
+    UINT w_ = 0, h_ = 0;
+    UINT stride_ = 0;
+    DWORD outBytes_ = 0;
+    LONGLONG t_ = 0;
+};
+
+// Draws the software path's NV12 pictures with GDI, letterboxed like the GPU renderer.
+class SoftRenderer {
+public:
+    void Present(HWND hwnd, const std::vector<uint8_t>& nv12, UINT w, UINT h, UINT ww, UINT wh) {
+        if (!hwnd || !w || !h || !ww || !wh || nv12.size() < size_t(w) * h * 3 / 2) return;
+        bgra_.resize(size_t(w) * h * 4);
+        ToBgra(nv12.data(), w, h, bgra_.data());
+
+        BITMAPINFO bi = {};
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = LONG(w);
+        bi.bmiHeader.biHeight = -LONG(h);  // top-down
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        const double k = (std::min)(double(ww) / w, double(wh) / h);
+        const LONG dw = LONG(w * k), dh = LONG(h * k);
+        const LONG dx = (LONG(ww) - dw) / 2, dy = (LONG(wh) - dh) / 2;
+        HDC dc = GetDC(hwnd);
+        if (!dc) return;
+        PatBlt(dc, 0, 0, LONG(ww), LONG(wh), BLACKNESS);  // the bars around the picture
+        SetStretchBltMode(dc, COLORONCOLOR);
+        StretchDIBits(dc, dx, dy, dw, dh, 0, 0, LONG(w), LONG(h), bgra_.data(), &bi, DIB_RGB_COLORS, SRCCOPY);
+        ReleaseDC(hwnd, dc);
+    }
+
+private:
+    // BT.709 limited-range YCbCr (as the encoder writes it) -> BGRA.
+    static void ToBgra(const uint8_t* nv12, UINT w, UINT h, uint8_t* out) {
+        const uint8_t* uvPlane = nv12 + size_t(w) * h;
+        auto clamp = [](int v) { return uint8_t(v < 0 ? 0 : v > 255 ? 255 : v); };
+        for (UINT j = 0; j < h; ++j) {
+            for (UINT i = 0; i < w; ++i) {
+                const int c = nv12[size_t(j) * w + i] - 16;
+                const uint8_t* uv = uvPlane + size_t(j / 2) * w + (i & ~1u);
+                const int d = uv[0] - 128, e = uv[1] - 128;
+                uint8_t* p = out + (size_t(j) * w + i) * 4;
+                p[0] = clamp((298 * c + 541 * d + 128) >> 8);             // B
+                p[1] = clamp((298 * c - 55 * d - 136 * e + 128) >> 8);    // G
+                p[2] = clamp((298 * c + 459 * e + 128) >> 8);             // R
+                p[3] = 255;
+            }
+        }
+    }
+
+    std::vector<uint8_t> bgra_;
+};
+
 inline void Worker(Viewer* v, std::string hostIp, int port, std::array<uint8_t, rd::kKeyLen> psk) {
     const std::string base = "RemoteDisplay - " + hostIp;
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     MFStartup(MF_VERSION);
 
+    // GPU path first (hardware decoder, Direct3D renderer). Without Direct3D 11 on this PC, fall back to the
+    // software decoder and GDI so the picture still shows.
     Renderer r(&v->winW, &v->winH);
     Decoder dec;
-    if (!r.Init(v->hwnd) || !dec.Init(r.device())) {
-        v->SetTitle(base + "  -  video decoder or renderer unavailable");
-        return;
+    const bool gpu = r.Init(v->hwnd) && dec.Init(r.device());
+    SoftDecoder sdec;
+    SoftRenderer srend;
+    std::vector<uint8_t> softPic;
+    if (!gpu) {
+        if (!sdec.Init()) {
+            v->SetTitle(base + "  -  video decoder or renderer unavailable");
+            return;
+        }
+        v->SetTitle(base + "  -  software video (no Direct3D 11 on this GPU)");
     }
 
     SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -756,19 +928,28 @@ inline void Worker(Viewer* v, std::string hostIp, int port, std::array<uint8_t, 
         if (needKey && !curKey) continue;
         if (curKey) needKey = false;
 
-        ID3D11Texture2D* tex = nullptr;
-        UINT slice = 0;
         uint64_t t0 = NowUs();
-        bool ok = dec.Decode(curBuf.data(), curBytes, &tex, &slice);
+        if (gpu) {
+            ID3D11Texture2D* tex = nullptr;
+            UINT slice = 0;
+            if (dec.Decode(curBuf.data(), curBytes, &tex, &slice) && tex) {
+                v->videoW = dec.width();
+                v->videoH = dec.height();
+                r.Present(tex, slice, dec.width(), dec.height());
+                ++statFrames;
+            }
+        } else {
+            UINT sw = 0, sh = 0;
+            if (sdec.Decode(curBuf.data(), curBytes, softPic, sw, sh)) {
+                v->videoW = sw;
+                v->videoH = sh;
+                srend.Present(v->hwnd, softPic, sw, sh, v->winW, v->winH);
+                ++statFrames;
+            }
+        }
         decUsSum += NowUs() - t0;
         lastDecoded = curId;
         haveDecoded = true;
-        if (ok && tex) {
-            v->videoW = dec.width();
-            v->videoH = dec.height();
-            r.Present(tex, slice, dec.width(), dec.height());
-            ++statFrames;
-        }
         statBytes += curBytes;
 
         if (NowUs() - statStart >= 1'000'000) {

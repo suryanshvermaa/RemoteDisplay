@@ -17,6 +17,8 @@
 
 #include "capture.h"
 #include "encoder.h"
+#include "gdi_capture.h"
+#include "soft_encoder.h"
 #include "identity.h"
 #include "inject.h"
 #include "protocol.h"
@@ -54,6 +56,9 @@ struct HostConfig {
     SecureSource* secure = nullptr;  // UAC / sign-in screen frames from the helper; may be null
     std::function<void(const std::string&)> log;  // optional diagnostics (the app writes them to its log)
     std::wstring displayName;  // GDI name of the output to capture (e.g. \\.\DISPLAY22); empty = first output
+    // "auto": DXGI when Direct3D 11 is available on the GPU, else GDI + software H.264 (whole desktop).
+    // "dxgi" or "gdi" force one path.
+    std::string capture = "auto";
 };
 
 struct HostStatus {
@@ -226,7 +231,21 @@ inline void RunHost(const HostConfig& cfg, std::atomic<bool>& stop, HostStatus& 
         return dup && followDevice();
     };
     cap.Init();  // duplication may be unavailable at start (secure desktop up); the device still works
-    if (!followDevice()) {
+    // No Direct3D 11 on the GPU (a display-only driver owns it) means DXGI cannot run: capture with GDI and
+    // encode in software instead. The config can force either path.
+    const bool gdiMode = cfg.capture == "gdi" || (cfg.capture != "dxgi" && !cap.HasDevice());
+    GdiCapture gdi;
+    SoftEncoder soft;
+    if (gdiMode) {
+        if (!gdi.Init() || !soft.Init(gdi.width(), gdi.height(), cfg.fps, cfg.mbps * 1'000'000)) {
+            st.SetError("Screen capture (GDI) or the software H.264 encoder is unavailable on this PC");
+            st.state = HostStatus::Failed;
+            return;
+        }
+        inject.SetDesktopRect(gdi.rect());
+        note("capture: GDI, whole desktop " + std::to_string(gdi.width()) + "x" + std::to_string(gdi.height()) +
+             ", software H.264 " + std::to_string(soft.width()) + "x" + std::to_string(soft.height()));
+    } else if (!followDevice()) {
         st.SetError("Screen capture or hardware H.264 encoder is unavailable on this PC");
         st.state = HostStatus::Failed;
         return;
@@ -280,6 +299,19 @@ inline void RunHost(const HostConfig& cfg, std::atomic<bool>& stop, HostStatus& 
         uint8_t kw[sizeof(rd::WireHeader) + sizeof(kh) + rd::kTagLen];
         const size_t kn = active.Seal(reinterpret_cast<uint8_t*>(&kh), sizeof(kh), kw);
         if (kn) sendto(sock.s, reinterpret_cast<char*>(kw), int(kn), 0, reinterpret_cast<const sockaddr*>(&peer.addr), sizeof(peer.addr));
+    };
+
+    // Per-second statistics for the status window: frames and bytes actually sent.
+    auto countFrame = [&](size_t bytes) {
+        statBytes += bytes;
+        ++statFrames;
+        if (NowUs() - statStart >= 1'000'000) {
+            double sec = (NowUs() - statStart) / 1e6;
+            st.fps = float(statFrames / sec);
+            st.mbps = float(statBytes * 8 / sec / 1e6);
+            statStart = NowUs();
+            statBytes = statFrames = 0;
+        }
     };
 
     while (!stop) {
@@ -450,6 +482,25 @@ inline void RunHost(const HostConfig& cfg, std::atomic<bool>& stop, HostStatus& 
         // --- Capture + encode + send --------------------------------------------------------
         // While the UAC prompt or sign-in screen is up, our own duplication cannot see it: take the
         // helper's frames instead. The pointer is not available there, so no cursor is sent.
+        // --- GDI path (no Direct3D 11 on this GPU): whole desktop, software H.264, paced to cfg.fps ----
+        if (gdiMode) {
+            if (!peer.valid || !active.valid() || st.state != HostStatus::Streaming) {
+                Sleep(20);
+                continue;
+            }
+            const uint64_t frameUs = NowUs();
+            bool key = false;
+            if (gdi.Grab() && soft.Encode(gdi.Bgra(), gdi.width(), gdi.height(), gdi.Pitch(), forceKey, packet, key)) {
+                if (forceKey && key) forceKey = false;
+                detail::SendFrame(sock.s, peer, active, packet, frameId++, key, frameUs);
+                countFrame(packet.size());
+            }
+            const uint64_t periodUs = 1'000'000ULL / (cfg.fps > 0 ? uint64_t(cfg.fps) : 30ULL);
+            const uint64_t spentUs = NowUs() - frameUs;
+            if (spentUs < periodUs) Sleep(DWORD((periodUs - spentUs) / 1000));
+            continue;
+        }
+
         const bool secureNow = cfg.secure && cfg.secure->Active();
         bool lost = false;
         ID3D11Texture2D* tex = nullptr;
@@ -493,15 +544,7 @@ inline void RunHost(const HostConfig& cfg, std::atomic<bool>& stop, HostStatus& 
         if (forceKey && key) forceKey = false;
 
         detail::SendFrame(sock.s, peer, active, packet, frameId++, key, capUs);
-        statBytes += packet.size();
-        ++statFrames;
-        if (NowUs() - statStart >= 1'000'000) {
-            double sec = (NowUs() - statStart) / 1e6;
-            st.fps = float(statFrames / sec);
-            st.mbps = float(statBytes * 8 / sec / 1e6);
-            statStart = NowUs();
-            statBytes = statFrames = 0;
-        }
+        countFrame(packet.size());
     }
     inject.ReleaseAll();
     st.controlling = false;

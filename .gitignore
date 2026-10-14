@@ -6,3 +6,4 @@ driver/out/
 installer/out/
 installer/obj/
 installer/stage/
+installer/stage-client/

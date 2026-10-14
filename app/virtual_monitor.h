@@ -8,7 +8,11 @@
 #include <newdev.h>
 #include <setupapi.h>
 
+#include <cstdlib>
+#include <cstring>
 #include <cwchar>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -193,6 +197,77 @@ inline std::string RunCapture(const std::wstring& command) {
 
 // Deletes every driver-store package of the virtual monitor (all versions), so an uninstall leaves nothing
 // behind. Returns the number of packages removed; `failed` is set if one could not be removed.
+// "0.03.15.0011" and "0.3.15.11" are the same version (INF files and pnputil spell it differently).
+inline std::string NormalizeVersion(const std::string& v) {
+    std::string out;
+    size_t start = 0;
+    for (;;) {
+        const size_t dot = v.find('.', start);
+        const std::string part = v.substr(start, dot == std::string::npos ? std::string::npos : dot - start);
+        if (!out.empty()) out += '.';
+        out += std::to_string(std::atoi(part.c_str()));
+        if (dot == std::string::npos) break;
+        start = dot + 1;
+    }
+    return out;
+}
+
+// The version of an INF: the last field of its DriverVer line ("DriverVer=06/21/2006,10.0.26100.1").
+inline std::string InfDriverVersion(const std::wstring& infPath) {
+    std::ifstream f(infPath);
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.rfind("DriverVer", 0) != 0) continue;
+        const size_t comma = line.rfind(',');
+        if (comma == std::string::npos) return "";
+        std::string v = line.substr(comma + 1);
+        const size_t first = v.find_first_not_of(" \t");
+        if (first == std::string::npos) return "";
+        v = v.substr(first);
+        v.erase(v.find_last_not_of(" \t\r\n") + 1);
+        return v;
+    }
+    return "";
+}
+
+// Looks in `pnputil /enum-drivers` text for a package whose Original Name is `originalName` at `version`.
+// Pure (no pnputil call), so it can be tested with recorded output.
+inline bool FindDriverInListing(const std::string& listing, const std::string& originalName, const std::string& version) {
+    auto trim = [](std::string s) {
+        const size_t a = s.find_first_not_of(" \t");
+        if (a == std::string::npos) return std::string();
+        s = s.substr(a);
+        s.erase(s.find_last_not_of(" \t\r") + 1);
+        return s;
+    };
+    const std::string want = NormalizeVersion(version);
+    std::istringstream in(listing);
+    std::string line;
+    bool nameMatch = false;
+    while (std::getline(in, line)) {
+        const size_t colon = line.find(':');
+        if (colon == std::string::npos) continue;
+        const std::string key = trim(line.substr(0, colon));
+        const std::string val = trim(line.substr(colon + 1));
+        if (key == "Published Name") {
+            nameMatch = false;
+        } else if (key == "Original Name") {
+            nameMatch = _stricmp(val.c_str(), originalName.c_str()) == 0;
+        } else if (key == "Driver Version" && nameMatch) {
+            // "10/25/2022 31.0.12044.3": the version is the last field
+            const size_t sp = val.rfind(' ');
+            if (sp != std::string::npos && NormalizeVersion(val.substr(sp + 1)) == want) return true;
+        }
+    }
+    return false;
+}
+
+// True if the driver store already holds `originalName` (e.g. remotedisplayvirtual.inf) at `version`.
+// A repeated install or repair then does not add the same package again.
+inline bool DriverPackageInStore(const std::string& originalName, const std::string& version) {
+    return FindDriverInListing(RunCapture(L"pnputil /enum-drivers"), originalName, version);
+}
+
 inline int RemoveDriverPackages(bool& failed) {
     failed = false;
     int removed = 0;
