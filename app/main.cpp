@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "admin.h"
+#include "diagnose.h"
 #include "discovery.h"
 #include "secure.h"
 #include "secure_helper.h"
@@ -23,12 +24,14 @@
 #include "service.h"
 #include "shared.h"
 #include "viewer.h"
+#include "ui_theme.h"
 
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "msimg32.lib")
 
 using namespace rdapp;
 
@@ -42,6 +45,7 @@ enum Ctl {
     IDC_DISCONNECT, IDC_REMOTE, IDC_REMOTE_KEY, IDC_CONNECT, IDC_MSG, IDC_HINT,
     IDC_LBL_ADDR, IDC_LBL_KEY, IDC_LBL_RADDR, IDC_LBL_RKEY, IDC_TITLE_L, IDC_TITLE_R,
     IDC_SVC_TITLE, IDC_SVC_STATUS, IDC_SVC_BTN, IDC_SVC_HINT, IDC_CONTROL, IDC_AUTOSTART, IDC_SHOWTRAY, IDC_TRUSTED, IDC_ADMIN, IDC_ADMIN_STATE, IDC_SVC_REMOVE, IDC_SECURE, IDC_DISPLAY_DUP, IDC_DISPLAY_EXT, IDC_FIND_DEVICES,
+    IDC_THEME, IDC_LBL_PERM, IDC_LBL_DISP,
 };
 enum class Elev { SvcInstall, SvcUninstall, AdminOn, AdminOff, TaskOn, TaskOff, SecureOn, SecureOff };
 enum TrayCmd { IDM_OPEN = 2001, IDM_TOGGLE, IDM_DISCONNECT, IDM_EXIT };
@@ -49,10 +53,35 @@ constexpr UINT kMsgViewerClosed = WM_APP + 10, kMsgSvcDone = WM_APP + 11, kMsgTr
                kMsgShow = WM_APP + 21, kMsgDevices = WM_APP + 30;
 constexpr UINT_PTR kTimerUi = 1, kTimerCopied = 2, kTimerFind = 3;
 
-constexpr COLORREF kBg = RGB(238, 241, 245), kCard = RGB(255, 255, 255), kBorder = RGB(217, 222, 231),
-                   kNavy = RGB(24, 34, 58), kAccent = RGB(37, 99, 235), kGreen = RGB(22, 163, 74),
-                   kRed = RGB(220, 38, 38), kAmber = RGB(217, 119, 6), kText = RGB(31, 41, 55),
+// Colour tokens used by the app logic (status lines, messages, tray icons). On screen they are mapped to the
+// current light or dark palette by Sem(); kNavy and kAccent also draw the tray / window icons.
+constexpr COLORREF kNavy = RGB(24, 34, 58), kAccent = RGB(99, 102, 241), kGreen = RGB(22, 163, 74),
+                   kRed = RGB(220, 38, 38), kAmber = RGB(217, 119, 6), kText = RGB(17, 24, 39),
                    kMuted = RGB(107, 114, 128);
+
+COLORREF Sem(COLORREF token) {
+    const rdui::Palette& p = rdui::P();
+    if (token == kGreen) return p.success;
+    if (token == kRed) return p.danger;
+    if (token == kAmber) return p.warning;
+    if (token == kMuted) return p.muted;
+    if (token == kAccent) return p.accent;
+    return p.text;
+}
+
+// Windows 11 ships Segoe UI Variable; older Windows keeps Segoe UI.
+const wchar_t* UiFontFace() {
+    static const wchar_t* face = [] {
+        using Fn = LONG(WINAPI*)(OSVERSIONINFOW*);
+        OSVERSIONINFOW vi = {sizeof(vi)};
+        if (auto fn = reinterpret_cast<Fn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion"))) fn(&vi);
+        return vi.dwBuildNumber >= 22000 ? L"Segoe UI Variable Text" : L"Segoe UI";
+    }();
+    return face;
+}
+
+// Keys read better in a monospaced font: Cascadia Mono ships with Windows 11, Consolas with older Windows.
+const wchar_t* MonoFontFace() { return wcscmp(UiFontFace(), L"Segoe UI") == 0 ? L"Consolas" : L"Cascadia Mono"; }
 
 // Draws the app icon at any size: navy tile, white monitor, optional status dot in the corner.
 HICON MakeIcon(int n, COLORREF dot, bool showDot) {
@@ -115,6 +144,8 @@ public:
         SetProcessDPIAware();
         INITCOMMONCONTROLSEX icc = {sizeof(icc), ICC_STANDARD_CLASSES};
         InitCommonControlsEx(&icc);
+        rdui::GdiplusScope gdiplus;  // anti-aliased drawing for the whole window's lifetime
+        rdui::ApplyTheme(rdui::ModeFromString(Config().Get(L"app", L"theme")));
 
         WNDCLASSW wc = {};
         wc.lpfnWndProc = WndProc;
@@ -128,13 +159,14 @@ public:
         app.background_ = background;
         app.autoShare_ = autoShare;
         app.dpi_ = GetDeviceCaps(GetDC(nullptr), LOGPIXELSX);
-        RECT rc = {0, 0, app.S(820), app.S(688)};
+        RECT rc = {0, 0, app.S(kWinW), app.S(kWinH)};
         AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
         HWND h = CreateWindowW(L"RemoteDisplayApp", L"RemoteDisplay",
                                WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN,
                                CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top, nullptr,
                                nullptr, inst, &app);
         if (!h) return 1;
+        rdui::ThemeTitleBar(h);
         HICON big = MakeIcon(GetSystemMetrics(SM_CXICON), kGreen, false);
         HICON smallIcon = MakeIcon(GetSystemMetrics(SM_CXSMICON), kGreen, false);
         SendMessage(h, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(big));
@@ -156,7 +188,7 @@ private:
     HFONT Font(int pt, bool bold) {
         return CreateFontW(-MulDiv(pt, dpi_, 72), 0, 0, 0, bold ? FW_SEMIBOLD : FW_NORMAL, FALSE, FALSE, FALSE,
                            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                           DEFAULT_PITCH, L"Segoe UI");
+                           DEFAULT_PITCH, UiFontFace());
     }
 
     HWND Add(const wchar_t* cls, const wchar_t* text, DWORD style, int x, int y, int w, int h, int id,
@@ -164,7 +196,72 @@ private:
         HWND c = CreateWindowExW(ex, cls, text, WS_CHILD | WS_VISIBLE | style, S(x), S(y), S(w), S(h), hwnd_,
                                  reinterpret_cast<HMENU>(INT_PTR(id)), inst_, nullptr);
         SendMessage(c, WM_SETFONT, reinterpret_cast<WPARAM>(fontNormal_), TRUE);
+        if (wcscmp(cls, L"BUTTON") == 0 && (style & BS_TYPEMASK) == BS_OWNERDRAW) rdui::MakeButton(c);
         return c;
+    }
+
+    // Layout, in 96-dpi pixels. Two cards under a top bar.
+    static constexpr int kWinW = 880, kWinH = 644, kTopBar = 56;
+    static constexpr RECT kCardL = {24, 72, 436, 624}, kCardR = {452, 72, 856, 624};
+
+    RECT Px(int x, int y, int w, int h) const { return RECT{S(x), S(y), S(x + w), S(y + h)}; }
+
+    // A toggle switch that behaves like a check box (IsDlgButtonChecked / CheckDlgButton).
+    HWND AddToggle(const wchar_t* text, int x, int y, int w, int id) {
+        HWND c = Add(L"BUTTON", text, BS_OWNERDRAW | WS_TABSTOP, x, y, w, 30, id);
+        SetPropW(c, L"rdtoggle", reinterpret_cast<HANDLE>(1));
+        return c;
+    }
+
+    // A text field: the rounded box is painted by the window, the borderless edit sits inside it.
+    HWND AddField(int x, int y, int w, int h, int id, DWORD style, HFONT font) {
+        HDC dc = GetDC(hwnd_);
+        HGDIOBJ old = SelectObject(dc, font);
+        TEXTMETRICW tm = {};
+        GetTextMetricsW(dc, &tm);
+        SelectObject(dc, old);
+        ReleaseDC(hwnd_, dc);
+        const RECT box = Px(x, y, w, h);
+        const int eh = tm.tmHeight + 2;
+        HWND c = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | style,
+                                 box.left + S(12), (box.top + box.bottom - eh) / 2, box.right - box.left - S(24), eh, hwnd_,
+                                 reinterpret_cast<HMENU>(INT_PTR(id)), inst_, nullptr);
+        SendMessage(c, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+        fields_.push_back({c, box});
+        return c;
+    }
+
+    // A themed drop-down (editable or a plain list).
+    HWND AddCombo(int x, int y, int w, int id, bool editable) {
+        const DWORD style = CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP |
+                            (editable ? CBS_DROPDOWN | CBS_AUTOHSCROLL : CBS_DROPDOWNLIST);
+        HWND c = Add(L"COMBOBOX", L"", style, x, y, w, 260, id);
+        rdui::MakeCombo(c, dpi_, rdui::P().surface);
+        return c;
+    }
+
+    bool FieldFocused(const RECT& box) const {
+        for (const auto& f : fields_)
+            if (EqualRect(&f.second, &box)) return GetFocus() == f.first;
+        return false;
+    }
+    void InvalidateField(HWND c) {
+        for (const auto& f : fields_) {
+            if (f.first != c) continue;
+            RECT r = f.second;
+            InflateRect(&r, S(4), S(4));
+            InvalidateRect(hwnd_, &r, FALSE);
+        }
+    }
+
+    // Applies a light / dark / system choice everywhere and saves it.
+    void SetThemeMode(rdui::Mode m, bool save) {
+        rdui::ApplyTheme(m);
+        if (save) cfg_->Set(L"app", L"theme", rdui::ModeToString(m));
+        rdui::ThemeTitleBar(hwnd_);
+        rdui::RethemeCombo(Ctrl(IDC_IPS), rdui::P().surface);
+        rdui::RethemeCombo(Ctrl(IDC_REMOTE), rdui::P().surface);
+        RedrawWindow(hwnd_, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_FRAME);
     }
     HWND Ctrl(int id) { return GetDlgItem(hwnd_, id); }
     void SetText(int id, const std::wstring& t) { SetWindowTextW(Ctrl(id), t.c_str()); }
@@ -177,9 +274,13 @@ private:
     void OnCreate() {
         fontNormal_ = Font(10, false);
         fontBold_ = Font(10, true);
-        fontTitle_ = Font(14, true);
+        fontTitle_ = Font(15, true);
         fontSmall_ = Font(9, false);
+        fontSection_ = Font(8, true);
         fontBig_ = Font(11, true);
+        fontHeader_ = Font(13, true);
+        fontMono_ = CreateFontW(-MulDiv(10, dpi_, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                                OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, FIXED_PITCH, MonoFontFace());
 
         cfg_ = std::make_unique<Config>();
         hostCfg_.psk = cfg_->HostKey();
@@ -188,47 +289,51 @@ private:
         hostCfg_.trust = &trust_;               // devices approved with "Always allow" skip the prompt
         cfg_->LoadDeviceIdentity(identity_);    // this PC's permanent key when it connects out
 
+        // ---- top bar: theme switch on the right
+        Add(L"BUTTON", L"", BS_OWNERDRAW | WS_TABSTOP, kWinW - 24 - 104, 10, 104, 36, IDC_THEME);
+
         // ---- left card: share this PC
-        Add(L"STATIC", L"THIS PC", SS_LEFT, 44, 108, 200, 16, IDC_LBL_ADDR + 100);
-        Add(L"STATIC", L"Share your screen", SS_LEFT, 44, 126, 320, 28, IDC_TITLE_L);
-        Add(L"STATIC", L"Your address", SS_LEFT, 44, 166, 200, 18, IDC_LBL_ADDR);
-        Add(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 44, 186, 252, 200, IDC_IPS);
-        Add(L"BUTTON", L"Copy", BS_PUSHBUTTON | WS_TABSTOP, 304, 186, 60, 28, IDC_COPY_IP);
-        Add(L"STATIC", L"Pairing key", SS_LEFT, 44, 224, 200, 18, IDC_LBL_KEY);
-        Add(L"EDIT", L"", ES_READONLY | ES_AUTOHSCROLL | WS_TABSTOP, 44, 244, 252, 28, IDC_KEY, WS_EX_CLIENTEDGE);
-        Add(L"BUTTON", L"Copy", BS_PUSHBUTTON | WS_TABSTOP, 304, 244, 60, 28, IDC_COPY_KEY);
-        Add(L"BUTTON", L"Generate a new key", BS_PUSHBUTTON | WS_TABSTOP, 44, 278, 150, 24, IDC_NEW_KEY);
-        Add(L"BUTTON", L"Trusted devices...", BS_PUSHBUTTON | WS_TABSTOP, 204, 278, 160, 24, IDC_TRUSTED);
-        Add(L"BUTTON", L"Ask me before allowing a connection", BS_AUTOCHECKBOX | WS_TABSTOP, 44, 306, 320, 24, IDC_APPROVE);
-        Add(L"BUTTON", L"Allow mouse and keyboard control", BS_AUTOCHECKBOX | WS_TABSTOP, 44, 332, 320, 24, IDC_CONTROL);
-        Add(L"BUTTON", L"Duplicate displays while sharing", BS_AUTOCHECKBOX | WS_TABSTOP, 44, 364, 200, 24, IDC_DISPLAY_DUP);
-        Add(L"BUTTON", L"Extend: stream virtual monitor", BS_AUTOCHECKBOX | WS_TABSTOP, 44, 388, 260, 24, IDC_DISPLAY_EXT);
-        Add(L"BUTTON", L"Start sharing", BS_OWNERDRAW | WS_TABSTOP, 44, 420, 320, 40, IDC_SHARE);
-        Add(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS, 44, 442, 226, 20, IDC_STATUS);
-        Add(L"BUTTON", L"Disconnect", BS_PUSHBUTTON | WS_TABSTOP, 276, 440, 88, 24, IDC_DISCONNECT);
+        Add(L"STATIC", L"THIS PC", SS_LEFT, 48, 90, 200, 16, IDC_LBL_ADDR + 100);
+        Add(L"STATIC", L"Share your screen", SS_LEFT, 48, 106, 364, 30, IDC_TITLE_L);
+        Add(L"STATIC", L"Your address", SS_LEFT, 48, 142, 200, 18, IDC_LBL_ADDR);
+        AddCombo(48, 160, 280, IDC_IPS, false);
+        Add(L"BUTTON", L"Copy", BS_OWNERDRAW | WS_TABSTOP, 336, 160, 76, 36, IDC_COPY_IP);
+        Add(L"STATIC", L"Pairing key", SS_LEFT, 48, 204, 200, 18, IDC_LBL_KEY);
+        AddField(48, 222, 280, 36, IDC_KEY, ES_READONLY, fontMono_);
+        Add(L"BUTTON", L"Copy", BS_OWNERDRAW | WS_TABSTOP, 336, 222, 76, 36, IDC_COPY_KEY);
+        Add(L"BUTTON", L"Generate new key", BS_OWNERDRAW | WS_TABSTOP, 48, 266, 176, 32, IDC_NEW_KEY);
+        Add(L"BUTTON", L"Trusted devices", BS_OWNERDRAW | WS_TABSTOP, 236, 266, 176, 32, IDC_TRUSTED);
+        Add(L"STATIC", L"PERMISSIONS", SS_LEFT, 48, 314, 200, 16, IDC_LBL_PERM);
+        AddToggle(L"Ask before allowing a connection", 48, 330, 364, IDC_APPROVE);
+        AddToggle(L"Allow mouse and keyboard control", 48, 360, 364, IDC_CONTROL);
+        Add(L"STATIC", L"DISPLAY WHILE SHARING", SS_LEFT, 48, 402, 220, 16, IDC_LBL_DISP);
+        AddToggle(L"Duplicate displays", 48, 418, 364, IDC_DISPLAY_DUP);
+        AddToggle(L"Extend to the virtual monitor", 48, 448, 364, IDC_DISPLAY_EXT);
+        Add(L"BUTTON", L"Start sharing", BS_OWNERDRAW | WS_TABSTOP, 48, 492, 364, 44, IDC_SHARE);
+        Add(L"STATIC", L"", SS_OWNERDRAW, 48, 546, 256, 28, IDC_STATUS);
+        Add(L"BUTTON", L"Disconnect", BS_OWNERDRAW | WS_TABSTOP, 316, 545, 96, 30, IDC_DISCONNECT);
 
-        // ---- background service (bottom of the left card)
-        Add(L"STATIC", L"RUN IN BACKGROUND", SS_LEFT, 44, 472, 200, 16, IDC_SVC_TITLE);
-        Add(L"BUTTON", L"Start with Windows", BS_AUTOCHECKBOX | WS_TABSTOP, 44, 492, 170, 24, IDC_AUTOSTART);
-        Add(L"BUTTON", L"Show tray icon", BS_AUTOCHECKBOX | WS_TABSTOP, 224, 492, 140, 24, IDC_SHOWTRAY);
-        Add(L"BUTTON", L"Run as administrator", BS_AUTOCHECKBOX | WS_TABSTOP, 44, 520, 190, 24, IDC_ADMIN);
-        Add(L"BUTTON", L"Restart as admin", BS_PUSHBUTTON | WS_TABSTOP, 244, 518, 120, 26, IDC_ADMIN_STATE);
-        Add(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS, 44, 580, 320, 22, IDC_SVC_STATUS);
-        Add(L"BUTTON", L"Install service", BS_PUSHBUTTON | WS_TABSTOP, 44, 608, 150, 28, IDC_SVC_BTN);
-        Add(L"BUTTON", L"Uninstall service", BS_PUSHBUTTON | WS_TABSTOP, 204, 608, 160, 28, IDC_SVC_REMOVE);
-        Add(L"BUTTON", L"Allow viewing UAC and sign-in screens (admin)", BS_AUTOCHECKBOX | WS_TABSTOP, 44, 548, 360, 24, IDC_SECURE);
+        // ---- right card: connect, then running in the background
+        Add(L"STATIC", L"REMOTE PC", SS_LEFT, 476, 90, 200, 16, IDC_LBL_RADDR + 100);
+        Add(L"STATIC", L"Connect to a computer", SS_LEFT, 476, 106, 356, 30, IDC_TITLE_R);
+        Add(L"STATIC", L"Remote address", SS_LEFT, 476, 142, 200, 18, IDC_LBL_RADDR);
+        AddCombo(476, 160, 356, IDC_REMOTE, true);
+        Add(L"STATIC", L"Pairing key", SS_LEFT, 476, 204, 200, 18, IDC_LBL_RKEY);
+        AddField(476, 222, 356, 36, IDC_REMOTE_KEY, 0, fontMono_);
+        Add(L"STATIC", L"Enter the address and pairing key shown in the other PC's RemoteDisplay window.", SS_LEFT, 476, 264, 356, 36, IDC_HINT);
+        Add(L"BUTTON", L"Find devices on this network", BS_OWNERDRAW | WS_TABSTOP, 476, 304, 356, 34, IDC_FIND_DEVICES);
+        Add(L"BUTTON", L"Connect", BS_OWNERDRAW | WS_TABSTOP, 476, 346, 356, 44, IDC_CONNECT);
+        Add(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS, 476, 394, 356, 20, IDC_MSG);
 
-        // ---- right card: connect
-        Add(L"STATIC", L"REMOTE PC", SS_LEFT, 436, 108, 200, 16, IDC_LBL_RADDR + 100);
-        Add(L"STATIC", L"Connect to a computer", SS_LEFT, 436, 126, 340, 28, IDC_TITLE_R);
-        Add(L"STATIC", L"Remote address", SS_LEFT, 436, 166, 200, 18, IDC_LBL_RADDR);
-        Add(L"COMBOBOX", L"", CBS_DROPDOWN | CBS_AUTOHSCROLL | WS_VSCROLL | WS_TABSTOP, 436, 186, 340, 220, IDC_REMOTE);
-        Add(L"STATIC", L"Pairing key", SS_LEFT, 436, 224, 200, 18, IDC_LBL_RKEY);
-        Add(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, 436, 244, 340, 28, IDC_REMOTE_KEY, WS_EX_CLIENTEDGE);
-        Add(L"STATIC", L"Enter the address and pairing key shown in the other PC's RemoteDisplay window.", SS_LEFT, 436, 282, 340, 44, IDC_HINT);
-        Add(L"BUTTON", L"Find devices on this network", BS_PUSHBUTTON | WS_TABSTOP, 436, 330, 340, 28, IDC_FIND_DEVICES);
-        Add(L"BUTTON", L"Connect", BS_OWNERDRAW | WS_TABSTOP, 436, 364, 340, 40, IDC_CONNECT);
-        Add(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS, 436, 414, 340, 20, IDC_MSG);
+        Add(L"STATIC", L"RUN IN BACKGROUND", SS_LEFT, 476, 432, 200, 16, IDC_SVC_TITLE);
+        AddToggle(L"Start with Windows", 476, 448, 356, IDC_AUTOSTART);
+        AddToggle(L"Show tray icon", 476, 476, 356, IDC_SHOWTRAY);
+        AddToggle(L"Run as administrator", 476, 504, 212, IDC_ADMIN);
+        Add(L"BUTTON", L"Restart as admin", BS_OWNERDRAW | WS_TABSTOP, 700, 504, 132, 28, IDC_ADMIN_STATE);
+        AddToggle(L"Control UAC and sign-in screens", 476, 532, 356, IDC_SECURE);
+        Add(L"STATIC", L"", SS_OWNERDRAW, 476, 572, 172, 30, IDC_SVC_STATUS);
+        Add(L"BUTTON", L"Install", BS_OWNERDRAW | WS_TABSTOP, 656, 572, 84, 30, IDC_SVC_BTN);
+        Add(L"BUTTON", L"Remove", BS_OWNERDRAW | WS_TABSTOP, 748, 572, 84, 30, IDC_SVC_REMOVE);
 
         for (const auto& ip : LocalIPv4()) SendMessageW(Ctrl(IDC_IPS), CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(W(ip).c_str()));
         if (SendMessage(Ctrl(IDC_IPS), CB_GETCOUNT, 0, 0) == 0)
@@ -543,14 +648,14 @@ private:
                 break;
             case Elev::SecureOn:
                 if (ok) {
-                    Message(L"Consent recorded. Every use of the UAC / sign-in screen is written to the audit log.", kGreen);
+                    Message(L"The UAC and sign-in screens can be viewed and controlled (host running as administrator). Every use is written to the audit log.", kGreen);
                 } else {
                     CheckDlgButton(hwnd_, IDC_SECURE, BST_UNCHECKED);
                     fail();
                 }
                 break;
             case Elev::SecureOff:
-                if (ok) Message(L"Consent withdrawn.", kMuted);
+                if (ok) Message(L"The UAC and sign-in screens are no longer shared.", kMuted);
                 else { CheckDlgButton(hwnd_, IDC_SECURE, BST_CHECKED); fail(); }
                 break;
             case Elev::TaskOff:
@@ -612,12 +717,12 @@ private:
         if (v.viaService && s != rdh::HostStatus::Failed && s != rdh::HostStatus::Starting && !connected &&
             s != rdh::HostStatus::AwaitingApproval)
             status = L"● Sharing in background - waiting for a connection";
-        statusColor_ = c;
-        if (status != lastStatus_) {
+        if (status != lastStatus_ || c != statusColor_) {  // repaint the status pill only when it changes
+            statusColor_ = c;
             lastStatus_ = status;
             SetText(IDC_STATUS, status);
+            InvalidateRect(Ctrl(IDC_STATUS), nullptr, FALSE);
         }
-        InvalidateRect(Ctrl(IDC_STATUS), nullptr, TRUE);
         ShowWindow(Ctrl(IDC_DISCONNECT), connected ? SW_SHOW : SW_HIDE);
         EnableWindow(Ctrl(IDC_NEW_KEY), !svcBusy_);
         EnableWindow(Ctrl(IDC_APPROVE), !sharing || true);
@@ -636,10 +741,10 @@ private:
         std::wstring ss, btn;
         COLORREF sc = kMuted;
         switch (svcState_) {
-            case SvcState::NotInstalled: ss = L"Windows service: not installed"; btn = L"Install service"; break;
-            case SvcState::Running: ss = L"● Windows service: running"; btn = L"Remove service"; sc = kGreen; break;
-            case SvcState::Stopped: ss = L"● Windows service: stopped"; btn = L"Remove service"; sc = kAmber; break;
-            case SvcState::Transition: ss = L"Windows service: changing..."; btn = L"Remove service"; sc = kAmber; break;
+            case SvcState::NotInstalled: ss = L"Service not installed"; btn = L"Install"; break;
+            case SvcState::Running: ss = L"● Service running"; btn = L"Remove"; sc = kGreen; break;
+            case SvcState::Stopped: ss = L"● Service stopped"; btn = L"Remove"; sc = kAmber; break;
+            case SvcState::Transition: ss = L"Service changing..."; btn = L"Remove"; sc = kAmber; break;
         }
         if (!svcBusy_) {
             svcColor_ = sc;
@@ -822,35 +927,47 @@ private:
         HDC mem = CreateCompatibleDC(dc);
         HBITMAP bmp = CreateCompatibleBitmap(dc, cr.right, cr.bottom);
         HGDIOBJ old = SelectObject(mem, bmp);
+        const rdui::Palette& p = rdui::P();
 
-        HBRUSH bg = CreateSolidBrush(kBg);
-        FillRect(mem, &cr, bg);
-        DeleteObject(bg);
-        RECT hdr = {0, 0, cr.right, S(78)};
-        HBRUSH nv = CreateSolidBrush(kNavy);
-        FillRect(mem, &hdr, nv);
-        DeleteObject(nv);
+        FillRect(mem, &cr, rdui::Brush(p.bg));
 
-        SetBkMode(mem, TRANSPARENT);
-        SelectObject(mem, Font(18, true));
-        SetTextColor(mem, RGB(255, 255, 255));
-        TextOutW(mem, S(24), S(12), L"RemoteDisplay", 13);
-        SelectObject(mem, fontNormal_);
-        SetTextColor(mem, RGB(170, 182, 207));
-        TextOutW(mem, S(26), S(46), L"Low-latency, end-to-end encrypted remote desktop", 48);
+        // Top bar: the app mark, name and tagline on the surface colour, a hairline below.
+        RECT bar = {0, 0, cr.right, S(kTopBar)};
+        FillRect(mem, &bar, rdui::Brush(p.surface));
+        RECT line = {0, S(kTopBar) - 1, cr.right, S(kTopBar)};
+        FillRect(mem, &line, rdui::Brush(p.border));
+        rdui::DrawLogo(mem, S(24), S(10), S(36));
+        rdui::Text(mem, L"RemoteDisplay", RECT{S(72), S(8), S(500), S(29)}, p.text, fontHeader_, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        rdui::Text(mem, L"Low-latency, end-to-end encrypted remote desktop", RECT{S(72), S(28), S(600), S(47)}, p.muted,
+                   fontSmall_, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 
-        HPEN pen = CreatePen(PS_SOLID, 1, kBorder);
-        HBRUSH card = CreateSolidBrush(kCard);
-        SelectObject(mem, pen);
-        SelectObject(mem, card);
-        RoundRect(mem, S(24), S(96), S(404), S(648), S(14), S(14));
-        RoundRect(mem, S(416), S(96), S(796), S(648), S(14), S(14));
-        DeleteObject(pen);
-        DeleteObject(card);
+        // Cards.
+        for (const RECT& c96 : {kCardL, kCardR}) {
+            const RECT c = Px(c96.left, c96.top, c96.right - c96.left, c96.bottom - c96.top);
+            rdui::SoftShadow(mem, c, float(S(16)), dpi_);
+            rdui::FillRound(mem, c, float(S(16)), p.surface, p.border);
+        }
+        // Divider above "Run in background" on the right card.
+        RECT div = Px(476, 420, 356, 1);
+        FillRect(mem, &div, rdui::Brush(p.border));
 
-        SetTextColor(mem, kMuted);
-        SelectObject(mem, fontSmall_);
-        TextOutW(mem, S(26), S(660), L"AES-128-GCM encrypted. Connections need your pairing key.", 56);
+        // Text fields.
+        for (const auto& f : fields_) {
+            POINT pt;
+            GetCursorPos(&pt);
+            ScreenToClient(hwnd_, &pt);
+            rdui::DrawField(mem, f.second, GetFocus() == f.first, PtInRect(&f.second, pt) != FALSE, dpi_);
+        }
+
+        // Footer of the left card: a small lock and the encryption note.
+        const int ly = S(592);
+        RECT lockBody = {S(48), ly + S(5), S(58), ly + S(13)};
+        rdui::FillRound(mem, lockBody, float(S(2)), p.muted);
+        rdui::Line(mem, float(S(50)), float(ly + S(5)), float(S(50)), float(ly + S(2)), p.muted, 1.4f * dpi_ / 96.f);
+        rdui::Line(mem, float(S(56)), float(ly + S(5)), float(S(56)), float(ly + S(2)), p.muted, 1.4f * dpi_ / 96.f);
+        rdui::Line(mem, float(S(50)), float(ly + S(2)), float(S(56)), float(ly + S(2)), p.muted, 1.4f * dpi_ / 96.f);
+        rdui::Text(mem, L"End-to-end encrypted (AES-128-GCM). Viewers need your pairing key.",
+                   RECT{S(66), ly, S(412), ly + S(18)}, p.muted, fontSmall_, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
 
         BitBlt(dc, 0, 0, cr.right, cr.bottom, mem, 0, 0, SRCCOPY);
         SelectObject(mem, old);
@@ -859,42 +976,53 @@ private:
         EndPaint(hwnd_, &ps);
     }
 
-    void DrawButton(const DRAWITEMSTRUCT* d) {
-        std::wstring label;
-        COLORREF fill;
+    void DrawItem(const DRAWITEMSTRUCT* d) {
+        if (d->CtlType == ODT_COMBOBOX && (d->itemState & ODS_COMBOBOXEDIT)) {
+            rdui::DrawComboItem(d, dpi_);  // the closed face: the combo repaints itself, nothing to draw here
+            return;
+        }
+        rdui::Buffered(d, [this](const DRAWITEMSTRUCT* b) { DrawItemNow(b); });
+    }
+
+    void DrawItemNow(const DRAWITEMSTRUCT* d) {
+        const rdui::Palette& p = rdui::P();
+        if (d->CtlType == ODT_COMBOBOX) {
+            rdui::DrawComboItem(d, dpi_);
+            return;
+        }
+        if (d->CtlType == ODT_STATIC) {  // status pills
+            wchar_t text[256] = {};
+            GetWindowTextW(d->hwndItem, text, 256);
+            const COLORREF c = Sem(d->CtlID == IDC_STATUS ? statusColor_ : svcColor_);
+            rdui::DrawPill(d, text, c, fontNormal_, dpi_, p.surface);
+            return;
+        }
+        if (d->CtlID == IDC_THEME) {
+            rdui::DrawThemeButton(d, fontBold_, dpi_, p.surface);
+            return;
+        }
+        if (rdui::IsToggle(d->hwndItem)) {
+            rdui::DrawToggle(d, fontNormal_, dpi_, p.surface);
+            return;
+        }
+        wchar_t text[128] = {};
+        GetWindowTextW(d->hwndItem, text, 128);
+        std::wstring label = text;
+        rdui::ButtonKind kind = rdui::ButtonKind::Secondary;
+        HFONT font = fontBold_;
         if (d->CtlID == IDC_SHARE) {
-            bool sharing = Sharing();
+            const bool sharing = Sharing();
             label = sharing ? L"Stop sharing" : L"Start sharing";
-            fill = sharing ? kRed : kGreen;
-            if (d->itemState & ODS_DISABLED) {
-                label = L"Sharing via background service";
-                fill = RGB(156, 163, 175);
-            }
-        } else {
-            label = L"Connect";
-            fill = kAccent;
+            if (d->itemState & ODS_DISABLED) label = L"Sharing via background service";
+            kind = sharing ? rdui::ButtonKind::Danger : rdui::ButtonKind::Success;
+            font = fontBig_;
+        } else if (d->CtlID == IDC_CONNECT) {
+            kind = rdui::ButtonKind::Primary;
+            font = fontBig_;
+        } else if (d->CtlID == IDC_DISCONNECT || d->CtlID == IDC_SVC_REMOVE) {
+            kind = rdui::ButtonKind::DangerOutline;
         }
-        if (d->itemState & ODS_SELECTED) fill = RGB(GetRValue(fill) * 3 / 4, GetGValue(fill) * 3 / 4, GetBValue(fill) * 3 / 4);
-        HBRUSH bg = CreateSolidBrush(kCard);
-        FillRect(d->hDC, &d->rcItem, bg);
-        DeleteObject(bg);
-        HBRUSH b = CreateSolidBrush(fill);
-        HPEN p = CreatePen(PS_SOLID, 1, fill);
-        SelectObject(d->hDC, b);
-        SelectObject(d->hDC, p);
-        RoundRect(d->hDC, d->rcItem.left, d->rcItem.top, d->rcItem.right, d->rcItem.bottom, S(10), S(10));
-        DeleteObject(b);
-        DeleteObject(p);
-        SetBkMode(d->hDC, TRANSPARENT);
-        SetTextColor(d->hDC, RGB(255, 255, 255));
-        SelectObject(d->hDC, fontBig_);
-        RECT r = d->rcItem;
-        DrawTextW(d->hDC, label.c_str(), -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        if (d->itemState & ODS_FOCUS) {
-            RECT f = d->rcItem;
-            InflateRect(&f, -S(4), -S(4));
-            DrawFocusRect(d->hDC, &f);
-        }
+        rdui::DrawButton(d, kind, label, font, dpi_, p.surface);
     }
 
     // ---- window procedure -----------------------------------------------------------------
@@ -918,25 +1046,44 @@ private:
             case WM_CREATE: OnCreate(); return 0;
             case WM_ERASEBKGND: return 1;
             case WM_PAINT: Paint(); return 0;
-            case WM_DRAWITEM: DrawButton(reinterpret_cast<DRAWITEMSTRUCT*>(l)); return TRUE;
+            case WM_DRAWITEM: DrawItem(reinterpret_cast<DRAWITEMSTRUCT*>(l)); return TRUE;
+            case WM_MEASUREITEM: {
+                auto* mi = reinterpret_cast<MEASUREITEMSTRUCT*>(l);
+                if (mi->CtlType == ODT_COMBOBOX) rdui::MeasureCombo(mi, S(30), S(34));
+                return TRUE;
+            }
+            case WM_CTLCOLOREDIT:
+                return rdui::FieldColors(reinterpret_cast<HDC>(w));
+            case WM_CTLCOLORLISTBOX:
+                return rdui::ListColors(reinterpret_cast<HDC>(w));
             case WM_CTLCOLORSTATIC: {
                 HDC dc = reinterpret_cast<HDC>(w);
-                int id = GetDlgCtrlID(reinterpret_cast<HWND>(l));
-                SetBkColor(dc, kCard);
-                SetTextColor(dc, kText);
+                const int id = GetDlgCtrlID(reinterpret_cast<HWND>(l));
+                if (id == IDC_KEY) return rdui::FieldColors(dc);  // a read-only edit asks with CTLCOLORSTATIC
+                const rdui::Palette& p = rdui::P();
+                SetBkColor(dc, p.surface);
+                SetTextColor(dc, p.text);
                 SelectObject(dc, fontNormal_);
-                if (id == IDC_STATUS) SetTextColor(dc, statusColor_);
-                else if (id == IDC_SVC_STATUS) SetTextColor(dc, svcColor_);
-                else if (id == IDC_SVC_TITLE) { SetTextColor(dc, kAccent); SelectObject(dc, fontSmall_); }
-                else if (id == IDC_SVC_HINT) { SetTextColor(dc, kMuted); SelectObject(dc, fontSmall_); }
-                else if (id == IDC_MSG) SetTextColor(dc, msgColor_);
-                else if (id == IDC_HINT || id == IDC_LBL_ADDR || id == IDC_LBL_KEY || id == IDC_LBL_RADDR ||
-                         id == IDC_LBL_RKEY) SetTextColor(dc, kMuted);
-                else if (id == IDC_TITLE_L || id == IDC_TITLE_R) SelectObject(dc, fontTitle_);
-                else if (id == IDC_LBL_ADDR + 100 || id == IDC_LBL_RADDR + 100) { SetTextColor(dc, kAccent); SelectObject(dc, fontSmall_); }
-                if (!cardBrush_) cardBrush_ = CreateSolidBrush(kCard);
-                return reinterpret_cast<LRESULT>(cardBrush_);
+                if (id == IDC_MSG) SetTextColor(dc, Sem(msgColor_));
+                else if (id == IDC_HINT) SetTextColor(dc, p.muted);
+                else if (id == IDC_LBL_ADDR || id == IDC_LBL_KEY || id == IDC_LBL_RADDR || id == IDC_LBL_RKEY) {
+                    SetTextColor(dc, p.muted);
+                    SelectObject(dc, fontSmall_);
+                } else if (id == IDC_TITLE_L || id == IDC_TITLE_R) {
+                    SelectObject(dc, fontTitle_);
+                } else if (id == IDC_LBL_ADDR + 100 || id == IDC_LBL_RADDR + 100 || id == IDC_SVC_TITLE ||
+                           id == IDC_LBL_PERM || id == IDC_LBL_DISP) {
+                    SetTextColor(dc, id == IDC_LBL_ADDR + 100 || id == IDC_LBL_RADDR + 100 ? p.accent : p.muted);
+                    SelectObject(dc, fontSection_);
+                }
+                return reinterpret_cast<LRESULT>(rdui::Brush(p.surface));
             }
+            case WM_SETTINGCHANGE:
+                // Windows switched between light and dark apps: follow it when the theme is "Auto".
+                if (l && wcscmp(reinterpret_cast<const wchar_t*>(l), L"ImmersiveColorSet") == 0 &&
+                    rdui::CurrentMode() == rdui::Mode::System)
+                    SetThemeMode(rdui::Mode::System, false);
+                break;
             case WM_TIMER:
                 if (w == kTimerUi) {
                     UpdateUi();
@@ -983,6 +1130,16 @@ private:
                 DestroyWindow(h);
                 return 0;
             case WM_COMMAND:
+                // Toggle switches flip themselves here, before the code below reads them like check boxes.
+                if (rdui::FlipIfToggle(reinterpret_cast<HWND>(l), HIWORD(w))) w = MAKEWPARAM(LOWORD(w), BN_CLICKED);
+                // Text fields and drop-downs show a focus ring: repaint their box when focus moves.
+                if (HIWORD(w) == EN_SETFOCUS || HIWORD(w) == EN_KILLFOCUS) InvalidateField(reinterpret_cast<HWND>(l));
+                if (LOWORD(w) == IDC_THEME && HIWORD(w) == BN_CLICKED) {  // Auto -> Light -> Dark -> Auto
+                    const rdui::Mode m = rdui::CurrentMode();
+                    SetThemeMode(m == rdui::Mode::System ? rdui::Mode::Light
+                                 : m == rdui::Mode::Light ? rdui::Mode::Dark : rdui::Mode::System, true);
+                    return 0;
+                }
                 switch (LOWORD(w)) {
                     case IDC_TRUSTED: ShowTrustedDialog(); break;
                     case IDM_OPEN: ShowMain(); break;
@@ -1157,7 +1314,9 @@ private:
     HINSTANCE inst_ = nullptr;
     HWND hwnd_ = nullptr;
     int dpi_ = 96;
-    HFONT fontNormal_ = nullptr, fontBold_ = nullptr, fontTitle_ = nullptr, fontSmall_ = nullptr, fontBig_ = nullptr;
+    HFONT fontNormal_ = nullptr, fontBold_ = nullptr, fontTitle_ = nullptr, fontSmall_ = nullptr, fontBig_ = nullptr,
+          fontHeader_ = nullptr, fontSection_ = nullptr, fontMono_ = nullptr;
+    std::vector<std::pair<HWND, RECT>> fields_;  // text fields: the edit and the rounded box painted around it
     HBRUSH cardBrush_ = nullptr;
     COLORREF statusColor_ = kMuted, msgColor_ = kRed, svcColor_ = kMuted;
     std::wstring lastStatus_, lastSvcStatus_, svcVerb_;
@@ -1217,6 +1376,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     if (argv) LocalFree(argv);
     if (mode == L"--service") return RunServiceMain();          // started by the Service Control Manager
     if (mode == L"--host-worker") return RunWorker();           // started by the service, in the user session
+    if (mode == L"--diagnose") return RunDiagnose();            // writes diagnostics.txt (GPUs, screens, encoders)
     if (mode == L"--secure-helper") return rdapp::RunSecureHelper(forceHelper);  // started by the service as SYSTEM
     if (mode == L"--service-ctl") return ServiceControl(arg2);  // elevated helper: install/uninstall/start/stop
     if (mode == L"--admin-ctl") return AdminControl(arg2, user);  // elevated helper: administrator-mode settings
