@@ -1,0 +1,193 @@
+name: release
+
+# Builds the Windows installers and the Android APK and puts them in a GitHub release.
+#
+#   git tag v1.2.0 && git push origin v1.2.0         builds and creates the release
+#   or: Actions > release > Run workflow             same, with a version typed in
+#
+# The release is created as a DRAFT by default: you look at it and press Publish yourself. Set the repository
+# variable RELEASE_DRAFT to "false" to publish at once.
+#
+# Where the release goes: this repository, or another one (for example a public repository that holds only
+# releases while this one stays private). For another repository set:
+#   variable RELEASE_REPO     owner/name of the repository that receives the release
+#   secret   RELEASES_TOKEN   a personal access token with write access to "Contents" in that repository
+#
+# Android signing (optional): add the secrets ANDROID_KEYSTORE_BASE64 (the keystore file, base64),
+# ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS and ANDROID_KEY_PASSWORD. Without them the APK is built
+# debug-signed, which installs fine for sideloading but is not for the Play Store.
+#
+# What CI cannot do: the virtual monitor driver (it needs the WDK and a driver signing certificate), and signing
+# the Windows files. The Windows installers here have no driver and are unsigned, so Windows SmartScreen will warn.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version, e.g. 1.2.0"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  VERSION: ${{ github.event.inputs.version || github.ref_name }}
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Work out the version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = "$env:VERSION".TrimStart('v')
+          if ($v -notmatch '^\d+\.\d+\.\d+(\.\d+)?$') { throw "version '$v' must look like 1.2.3" }
+          $parts = $v.Split('.') + @('0')
+          $msi = ($parts[0..3]) -join '.'          # an MSI version has exactly four numbers
+          "version=$v"  >> $env:GITHUB_OUTPUT
+          "msi=$msi"    >> $env:GITHUB_OUTPUT
+
+      - name: Build
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          cmake --build build --config Release
+
+      - name: Unit tests (no display, GPU or administrator needed)
+        shell: pwsh
+        run: |
+          $failed = @()
+          foreach ($t in "test-edid", "test-session", "test-capture-layout", "test-driver-store") {
+            & ".\build\Release\$t.exe"
+            if ($LASTEXITCODE -ne 0) { $failed += $t }
+          }
+          if ($failed) { throw "failed: $($failed -join ', ')" }
+
+      - name: WiX
+        shell: pwsh
+        run: |
+          $found = @("C:\Program Files (x86)\WiX Toolset v3.14\bin\candle.exe", "C:\Program Files (x86)\WiX Toolset v3.11\bin\candle.exe") | Where-Object { Test-Path $_ }
+          if (-not $found) { choco install wixtoolset --no-progress -y }
+
+      - name: Installers
+        shell: pwsh
+        run: |
+          $msiVersion = "${{ steps.ver.outputs.msi }}"
+          powershell -ExecutionPolicy Bypass -File installer\Build-Installer.ps1 -Version $msiVersion
+          powershell -ExecutionPolicy Bypass -File installer\Build-Client.ps1 -Version $msiVersion
+
+      - name: Name the files
+        shell: pwsh
+        run: |
+          $v = "${{ steps.ver.outputs.version }}"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item installer\out\RemoteDisplaySetup.msi       "dist\RemoteDisplay-Setup-v$v.msi"
+          Copy-Item installer\out\RemoteDisplayClientSetup.msi "dist\RemoteDisplay-Client-Setup-v$v.msi"
+          Copy-Item installer\out\RemoteDisplayClient.exe      "dist\RemoteDisplay-Client-v$v.exe"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+
+  android:
+    runs-on: ubuntu-latest
+    env:
+      HAS_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Work out the version
+        id: ver
+        run: |
+          v="${VERSION#v}"
+          [[ "$v" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)(\.[0-9]+)?$ ]] || { echo "version '$v' must look like 1.2.3"; exit 1; }
+          code=$(( BASH_REMATCH[1] * 1000000 + BASH_REMATCH[2] * 1000 + BASH_REMATCH[3] ))   # 1.2.3 -> 1002003
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Unit tests
+        working-directory: android
+        run: ./gradlew testDebugUnitTest --console=plain
+
+      - name: Signing key
+        if: env.HAS_KEYSTORE == 'true'
+        run: |
+          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > "$RUNNER_TEMP/release.keystore"
+          {
+            echo "ANDROID_KEYSTORE_FILE=$RUNNER_TEMP/release.keystore"
+            echo "ANDROID_KEYSTORE_PASSWORD=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}"
+            echo "ANDROID_KEY_ALIAS=${{ secrets.ANDROID_KEY_ALIAS }}"
+            echo "ANDROID_KEY_PASSWORD=${{ secrets.ANDROID_KEY_PASSWORD }}"
+          } >> "$GITHUB_ENV"
+
+      - name: Build the APK
+        working-directory: android
+        run: |
+          args="-PversionName=${{ steps.ver.outputs.version }} -PversionCode=${{ steps.ver.outputs.code }} --console=plain"
+          if [ "$HAS_KEYSTORE" = "true" ]; then
+            ./gradlew assembleRelease $args
+            cp app/build/outputs/apk/release/app-release.apk "$RUNNER_TEMP/app.apk"
+          else
+            ./gradlew assembleDebug $args
+            cp app/build/outputs/apk/debug/app-debug.apk "$RUNNER_TEMP/app.apk"
+          fi
+
+      - name: Name the file
+        run: |
+          mkdir dist
+          cp "$RUNNER_TEMP/app.apk" "dist/RemoteDisplay-Android-v${{ steps.ver.outputs.version }}.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: dist/*
+
+  publish:
+    needs: [windows, android]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.RELEASES_TOKEN || secrets.GITHUB_TOKEN }}
+      TARGET_REPO: ${{ vars.RELEASE_REPO || github.repository }}
+      DRAFT: ${{ vars.RELEASE_DRAFT || 'true' }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+
+      - name: Create the release
+        run: |
+          v="${VERSION#v}"
+          flags=""
+          [ "$DRAFT" = "true" ] && flags="--draft"
+          cat > notes.md <<EOF
+          ## RemoteDisplay v$v
+
+          **Windows**
+          - \`RemoteDisplay-Setup-v$v.msi\`: the app (share this PC, and connect to others) and the background service.
+          - \`RemoteDisplay-Client-Setup-v$v.msi\` / \`RemoteDisplay-Client-v$v.exe\`: the viewer only, as an installer or a plain file that runs without installing.
+
+          **Android**
+          - \`RemoteDisplay-Android-v$v.apk\`: the viewer for phones and tablets (Android 8 or later). Open the file on the phone to install it.
+
+          These files are not code-signed yet, so Windows SmartScreen may warn on first run. The virtual monitor driver is not part of these installers. Check the files against \`SHA256SUMS.txt\`.
+          EOF
+          sed -i 's/^          //' notes.md
+          gh release create "v$v" dist/* --repo "$TARGET_REPO" --title "RemoteDisplay v$v" --notes-file notes.md $flags

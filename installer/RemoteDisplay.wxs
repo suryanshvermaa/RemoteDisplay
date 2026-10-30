@@ -34,10 +34,14 @@
          msiexec /i RemoteDisplaySetup.msi ADDLOCAL=Main,VirtualMonitor
          and remove only it, keeping the app, with
          msiexec /i RemoteDisplaySetup.msi REMOVE=VirtualMonitor -->
+    <!-- Only present when the build has the signed driver package (Build-Installer.ps1 passes -dWithDriver=1).
+         Release builds made by CI have no driver, and the MSI then installs the app and service only. -->
+    <?ifdef WithDriver?>
     <Feature Id="VirtualMonitor" Title="Virtual monitor driver (optional)"
              Description="Adds the RemoteDisplay virtual monitor, a second screen for sharing." Level="0">
       <ComponentGroupRef Id="DriverFiles" />
     </Feature>
+    <?endif?>
 
     <Directory Id="TARGETDIR" Name="SourceDir">
       <Directory Id="ProgramFiles64Folder">
@@ -65,6 +69,7 @@
     </ComponentGroup>
 
     <!-- Driver package: copied next to the program; the install step adds it to the driver store. -->
+    <?ifdef WithDriver?>
     <ComponentGroup Id="DriverFiles" Directory="DRIVERFOLDER">
       <Component Id="DriverInfComponent" Guid="5C1A9E42-0D7B-4B8F-9E63-A2F4C18D7B01">
         <File Id="DriverInf" Source="$(var.StageDir)\driver\RemoteDisplayVirtual.inf" KeyPath="yes" />
@@ -76,15 +81,18 @@
         <File Id="DriverDll" Source="$(var.StageDir)\driver\RemoteDisplayVirtual.dll" KeyPath="yes" />
       </Component>
     </ComponentGroup>
+    <?endif?>
 
     <!-- Install steps, after the files are in place, as SYSTEM. A driver problem is logged, not fatal, so the
          app still installs. The service step must succeed. -->
+    <?ifdef WithDriver?>
     <CustomAction Id="CA_DriverInstall"
                   FileKey="RemoteDisplayExe"
                   ExeCommand="--admin-ctl driver-install"
                   Execute="deferred"
                   Impersonate="no"
                   Return="ignore" />
+    <?endif?>
     <CustomAction Id="CA_ServiceInstall"
                   FileKey="RemoteDisplayExe"
                   ExeCommand="--service-ctl install"
@@ -107,12 +115,21 @@
                   Return="ignore" />
 
     <InstallExecuteSequence>
+      <?ifdef WithDriver?>
       <!-- The driver is installed only when its optional feature is selected (&amp;: will be installed). -->
       <Custom Action="CA_DriverInstall" After="InstallFiles">&amp;VirtualMonitor=3 AND NOT REMOVE</Custom>
       <Custom Action="CA_ServiceInstall" After="CA_DriverInstall">NOT REMOVE</Custom>
+      <?else?>
+      <Custom Action="CA_ServiceInstall" After="InstallFiles">NOT REMOVE</Custom>
+      <?endif?>
       <Custom Action="CA_ServiceUninstall" Before="RemoveFiles">REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE</Custom>
+      <?ifdef WithDriver?>
       <!-- The driver is removed when the whole product is removed, or when only its feature is removed. -->
       <Custom Action="CA_DriverPurge" Before="RemoveFiles">NOT UPGRADINGPRODUCTCODE AND ((&amp;VirtualMonitor=2 AND !VirtualMonitor=3) OR REMOVE="ALL")</Custom>
+      <?else?>
+      <!-- No driver in this MSI, but a full removal still cleans up one installed by another build. -->
+      <Custom Action="CA_DriverPurge" Before="RemoveFiles">REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE</Custom>
+      <?endif?>
     </InstallExecuteSequence>
   </Product>
 </Wix>
