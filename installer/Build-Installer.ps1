@@ -10,6 +10,9 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $exe = Join-Path $root "build\Release\RemoteDisplay.exe"
 $pkg = Join-Path $root "driver\out\pkg"
+# A copy of the package is committed in driver\prebuilt, so a CI build (no WDK) can still include it.
+$prebuilt = Join-Path $root "driver\prebuilt"
+if (-not (Test-Path (Join-Path $pkg "RemoteDisplayVirtual.inf")) -and (Test-Path (Join-Path $prebuilt "RemoteDisplayVirtual.inf"))) { $pkg = $prebuilt }
 $stage = Join-Path $PSScriptRoot "stage"
 $out = Join-Path $PSScriptRoot "out"
 
