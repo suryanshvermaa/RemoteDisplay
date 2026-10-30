@@ -134,6 +134,9 @@ public:
     UINT bgraWidth() const { return pipe_.bw; }  // combined desktop size
     UINT bgraHeight() const { return pipe_.bh; }
     size_t screenCount() const { return outs_.size(); }  // screens in the combined picture
+    // True when Windows refuses to duplicate the screen from this process at all: on a laptop with two GPUs,
+    // when the app runs on the dedicated GPU but the screen is wired to the integrated one. Not temporary.
+    bool DuplicationUnsupported() const { return lastDupError_ == DXGI_ERROR_UNSUPPORTED; }
 
 private:
     // The textures and video processor that turn a BGRA picture into NV12. Built whole or not at all.
@@ -252,7 +255,11 @@ private:
     bool DuplicateAll(bool& modeChanged) {
         for (auto& o : outs_) {
             ComPtr<IDXGIOutputDuplication> d;
-            if (FAILED(o.out1->DuplicateOutput(dev_.Get(), &d))) return false;
+            if (HRESULT e = o.out1->DuplicateOutput(dev_.Get(), &d); FAILED(e)) {
+                lastDupError_ = e;  // DXGI_ERROR_UNSUPPORTED: this process runs on another GPU than the screen
+                return false;
+            }
+            lastDupError_ = S_OK;
             DXGI_OUTDUPL_DESC dd = {};
             d->GetDesc(&dd);
             if (dd.ModeDesc.Width != UINT(rdcap::RectW(o.rect)) || dd.ModeDesc.Height != UINT(rdcap::RectH(o.rect))) {
@@ -451,4 +458,5 @@ private:
     std::vector<uint8_t> cursorBlob_;
     uint32_t cursorId_ = 0;
     bool cursorChanged_ = false;
+    HRESULT lastDupError_ = S_OK;
 };

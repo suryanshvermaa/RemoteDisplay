@@ -2,6 +2,7 @@
 // Hardware H.264 encoder via Media Foundation (NVENC / AMF / QuickSync, vendor-neutral).
 // Tuned for latency: CBR, no B-frames, low-latency mode, on-demand IDR, drop-if-busy.
 #include <d3d11.h>
+#include <dxgi.h>
 #include <mfapi.h>
 #include <mferror.h>
 #include <mfidl.h>
@@ -12,6 +13,7 @@
 #include <mmsystem.h>
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -34,6 +36,17 @@ public:
         if (FAILED(MFCreateDXGIDeviceManager(&token, &mgr_))) return false;
         if (FAILED(mgr_->ResetDevice(dev, token))) return false;
 
+        // Laptops with two GPUs list one hardware encoder per GPU. Only the encoder on the GPU that owns the
+        // capture device can take its textures, so that one is tried first; the others are only a fallback.
+        LUID devLuid = {};
+        {
+            ComPtr<IDXGIDevice> dxgiDev;
+            ComPtr<IDXGIAdapter> adapter;
+            DXGI_ADAPTER_DESC ad = {};
+            if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&dxgiDev))) && SUCCEEDED(dxgiDev->GetAdapter(&adapter)) &&
+                SUCCEEDED(adapter->GetDesc(&ad)))
+                devLuid = ad.AdapterLuid;
+        }
         MFT_REGISTER_TYPE_INFO in = {MFMediaType_Video, MFVideoFormat_NV12};
         MFT_REGISTER_TYPE_INFO out = {MFMediaType_Video, MFVideoFormat_H264};
         IMFActivate** acts = nullptr;
@@ -42,17 +55,69 @@ public:
                              MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER, &in, &out, &acts,
                              &count)) || count == 0)
             ENC_FAIL("MFTEnumEx: no hardware H.264 encoder", count);
-        HRESULT hr = acts[0]->ActivateObject(IID_PPV_ARGS(&mft_));
+        std::vector<IMFActivate*> order;
+        for (UINT32 i = 0; i < count; ++i)
+            if (SameAdapter(acts[i], devLuid)) order.push_back(acts[i]);
+        for (UINT32 i = 0; i < count; ++i)
+            if (!SameAdapter(acts[i], devLuid)) order.push_back(acts[i]);
+        bool ready = false;
+        for (IMFActivate* a : order) {
+            if (TryEncoder(a, bitrateBps)) {
+                ready = true;
+                break;
+            }
+            a->ShutdownObject();
+        }
         for (UINT32 i = 0; i < count; ++i) acts[i]->Release();
         CoTaskMemFree(acts);
-        if (FAILED(hr)) ENC_FAIL("ActivateObject", hr);
+        if (!ready) ENC_FAIL("no hardware H.264 encoder accepted this GPU's frames", count);
+        return true;
+    }
 
+    // Name of the encoder in use (for the log), e.g. "NVIDIA H.264 Encoder MFT".
+    std::wstring Name() const { return name_; }
+
+private:
+    static bool SameAdapter(IMFActivate* a, const LUID& luid) {
+        UINT8 blob[sizeof(LUID)] = {};
+        UINT32 n = 0;
+        if (SUCCEEDED(a->GetBlob(MFT_ENUM_ADAPTER_LUID, blob, sizeof(blob), &n)) && n == sizeof(LUID)) {
+            LUID l;
+            memcpy(&l, blob, sizeof(l));
+            return l.LowPart == luid.LowPart && l.HighPart == luid.HighPart;
+        }
+        UINT64 v = 0;
+        if (SUCCEEDED(a->GetUINT64(MFT_ENUM_ADAPTER_LUID, &v)))
+            return LONG(v >> 32) == luid.HighPart && DWORD(v) == luid.LowPart;
+        return false;  // unknown adapter: tried after the matching ones
+    }
+
+    // Activates one encoder and configures it for this device. False (and nothing kept) if any step fails.
+    bool TryEncoder(IMFActivate* a, UINT bitrateBps) {
+        mft_.Reset();
+        codec_.Reset();
+        events_.Reset();
+        if (FAILED(a->ActivateObject(IID_PPV_ARGS(&mft_)))) return false;
+        wchar_t nm[128] = {};
+        UINT32 nl = 0;
+        name_ = SUCCEEDED(a->GetString(MFT_FRIENDLY_NAME_Attribute, nm, 128, &nl)) ? nm : L"hardware encoder";
         ComPtr<IMFAttributes> attrs;
-        mft_->GetAttributes(&attrs);
+        if (FAILED(mft_->GetAttributes(&attrs)) || !attrs) return false;
         attrs->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
         attrs->SetUINT32(MF_LOW_LATENCY, TRUE);
-        mft_->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, reinterpret_cast<ULONG_PTR>(mgr_.Get()));
+        if (FAILED(mft_->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, reinterpret_cast<ULONG_PTR>(mgr_.Get())))) {
+            mft_.Reset();
+            return false;  // this encoder cannot use the capture GPU (the other GPU's encoder)
+        }
+        if (!Configure(bitrateBps)) {
+            mft_.Reset();
+            return false;
+        }
+        return true;
+    }
 
+    bool Configure(UINT bitrateBps) {
+        const UINT w = w_, h = h_, fps = fps_;
         mft_.As(&codec_);
         if (codec_) {
             SetU32(CODECAPI_AVLowLatencyMode, TRUE);
@@ -99,6 +164,7 @@ public:
         return true;
     }
 
+public:
     // Encodes one NV12 texture. Returns true with `out` filled when a packet came back.
     // If the encoder is still busy with the previous frame the frame is dropped (returns false).
     bool Encode(ID3D11Texture2D* tex, bool forceKey, std::vector<uint8_t>& out, bool& isKey) {
@@ -193,6 +259,7 @@ private:
     ComPtr<IMFDXGIDeviceManager> mgr_;
     ComPtr<IMFTransform> mft_;
     ComPtr<ICodecAPI> codec_;
+    std::wstring name_;
     ComPtr<IMFMediaEventGenerator> events_;
     UINT w_ = 0, h_ = 0, fps_ = 60;
     DWORD outBufSize_ = 0;

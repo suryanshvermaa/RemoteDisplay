@@ -42,6 +42,8 @@ struct SecureSource {
     // Uploads the newest secure frame into `cap` and returns it. Without `needFrame` it returns nullptr
     // unless the frame is new; with it (a viewer needs a picture now) it returns the current frame.
     virtual ID3D11Texture2D* Upload(Capture& cap, bool needFrame) = 0;
+    // Passes input to the secure desktop (kind: 0 event, 1 move, 2 release all). False if it cannot be delivered.
+    virtual bool ForwardInput(int kind, const rd::InputEvent& ev) { (void)kind; (void)ev; return false; }
 };
 
 struct HostConfig {
@@ -213,7 +215,9 @@ inline void RunHost(const HostConfig& cfg, std::atomic<bool>& stop, HostStatus& 
             encReady = enc.Init(cap.device(), cap.width(), cap.height(), cfg.fps, cfg.mbps * 1'000'000);
             inject.SetDesktopRect(cap.desktopRect());
             forceKey = true;
-            note(encReady ? "encoder ready " + std::to_string(cap.width()) + "x" + std::to_string(cap.height())
+            std::string encName;
+            for (wchar_t c : enc.Name()) encName += (c < 128 ? char(c) : '?');
+            note(encReady ? "encoder ready " + std::to_string(cap.width()) + "x" + std::to_string(cap.height()) + " (" + encName + ")"
                           : std::string("encoder setup failed"));
         }
         return encReady;
@@ -231,22 +235,56 @@ inline void RunHost(const HostConfig& cfg, std::atomic<bool>& stop, HostStatus& 
         return dup && followDevice();
     };
     cap.Init();  // duplication may be unavailable at start (secure desktop up); the device still works
-    // No Direct3D 11 on the GPU (a display-only driver owns it) means DXGI cannot run: capture with GDI and
-    // encode in software instead. The config can force either path.
-    const bool gdiMode = cfg.capture == "gdi" || (cfg.capture != "dxgi" && !cap.HasDevice());
+    // GDI capture + software H.264 is the fallback that works on any PC. It is used when the GPU path cannot
+    // run: no Direct3D 11 (a display-only driver owns the GPU), no hardware encoder that accepts the capture
+    // GPU's frames, or - on laptops with two GPUs - Windows refusing screen duplication from this process.
+    // "dxgi" or "gdi" in the config forces one path.
+    bool gdiMode = false;
     GdiCapture gdi;
     SoftEncoder soft;
-    if (gdiMode) {
-        if (!gdi.Init() || !soft.Init(gdi.width(), gdi.height(), cfg.fps, cfg.mbps * 1'000'000)) {
-            st.SetError("Screen capture (GDI) or the software H.264 encoder is unavailable on this PC");
-            st.state = HostStatus::Failed;
-            return;
-        }
+    auto switchToGdi = [&](const std::string& why) {
+        if (!gdi.Init() || !soft.Init(gdi.width(), gdi.height(), cfg.fps, cfg.mbps * 1'000'000)) return false;
+        gdiMode = true;
+        forceKey = true;
         inject.SetDesktopRect(gdi.rect());
-        note("capture: GDI, whole desktop " + std::to_string(gdi.width()) + "x" + std::to_string(gdi.height()) +
-             ", software H.264 " + std::to_string(soft.width()) + "x" + std::to_string(soft.height()));
-    } else if (!followDevice()) {
-        st.SetError("Screen capture or hardware H.264 encoder is unavailable on this PC");
+        note("capture: GDI (" + why + "), whole desktop " + std::to_string(gdi.width()) + "x" +
+             std::to_string(gdi.height()) + ", software H.264 " + std::to_string(soft.width()) + "x" +
+             std::to_string(soft.height()));
+        return true;
+    };
+    // Hybrid-GPU laptops: ask Windows to run this program on the integrated GPU (the one wired to the screen)
+    // from the next start, so the fast GPU path works. This is the per-app setting in Settings > Display >
+    // Graphics; a choice the user made there is left alone.
+    auto preferScreenGpu = [&]() {
+        wchar_t exe[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        HKEY k = nullptr;
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\DirectX\\UserGpuPreferences", 0, nullptr, 0,
+                            KEY_QUERY_VALUE | KEY_SET_VALUE, nullptr, &k, nullptr) != ERROR_SUCCESS)
+            return;
+        if (RegQueryValueExW(k, exe, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) {
+            const wchar_t pref[] = L"GpuPreference=1;";  // 1 = power saving = the integrated GPU
+            RegSetValueExW(k, exe, 0, REG_SZ, reinterpret_cast<const BYTE*>(pref), sizeof(pref));
+            note("this laptop has two GPUs: RemoteDisplay will use the screen's GPU from the next start");
+        }
+        RegCloseKey(k);
+    };
+    const bool autoMode = cfg.capture != "dxgi" && cfg.capture != "gdi";
+    bool ready = false;
+    if (cfg.capture == "gdi") {
+        ready = switchToGdi("forced in the config");
+    } else if (autoMode && !cap.HasDevice()) {
+        ready = switchToGdi("no Direct3D 11 on this GPU");
+    } else if (autoMode && cap.DuplicationUnsupported()) {
+        preferScreenGpu();
+        ready = switchToGdi("screen duplication refused: the app runs on another GPU than the screen");
+    } else if (followDevice()) {
+        ready = true;
+    } else if (autoMode) {
+        ready = switchToGdi("no hardware encoder accepted this GPU's frames");
+    }
+    if (!ready) {
+        st.SetError("Screen capture or the H.264 encoder is unavailable on this PC");
         st.state = HostStatus::Failed;
         return;
     }
@@ -268,6 +306,7 @@ inline void RunHost(const HostConfig& cfg, std::atomic<bool>& stop, HostStatus& 
     bool haveDev = false;  // the viewer proved which device it is (Identify)
     uint64_t approvedAt = 0, lastKeepalive = 0, lastControlUs = 0, lastCursorSend = 0;
     uint32_t inputNext = 0;  // next reliable input sequence number we expect from the viewer
+    bool injectOnSecure = false;  // the last input went to the secure desktop (through the helper)
     bool cursorSendNow = false;
     st.state = HostStatus::Waiting;
 
@@ -435,9 +474,16 @@ inline void RunHost(const HostConfig& cfg, std::atomic<bool>& stop, HostStatus& 
             } else if (h.type == uint8_t(rd::PacketType::InputMove) || h.type == uint8_t(rd::PacketType::Input)) {
                 // Input only counts after the local user approved this viewer AND allows control.
                 if (st.state != HostStatus::Streaming || !cfg.allowControl) continue;
-                // The consent covers viewing the UAC prompt / sign-in screen, not typing into it: input
-                // is received and acknowledged there but never injected.
-                const bool injectOk = !(cfg.secure && cfg.secure->Active());
+                // While the UAC prompt or sign-in screen is up, this process cannot type or click there: the
+                // SYSTEM helper does it. The helper only accepts input from an administrator host (see
+                // secure_feed.h); otherwise the input is acknowledged and dropped, and the screen is view-only.
+                const bool onSecure = cfg.secure && cfg.secure->Active();
+                if (onSecure != injectOnSecure) {
+                    if (onSecure) inject.ReleaseAll();  // nothing stays held down on the desktop we are leaving
+                    else cfg.secure->ForwardInput(2, rd::InputEvent{});
+                    injectOnSecure = onSecure;
+                }
+                const bool injectOk = !onSecure;
                 const uint8_t* body = plain + sizeof(h);
                 const size_t bl = pl - sizeof(h);
                 if (h.type == uint8_t(rd::PacketType::InputMove)) {
@@ -445,6 +491,7 @@ inline void RunHost(const HostConfig& cfg, std::atomic<bool>& stop, HostStatus& 
                     rd::MoveBody mb;
                     memcpy(&mb, body, sizeof(mb));
                     if (injectOk) inject.Move(mb.x, mb.y);
+                    else cfg.secure->ForwardInput(1, rd::InputEvent{0, 0, mb.x, mb.y, 0});
                 } else {
                     if (bl < sizeof(rd::InputBody)) continue;
                     rd::InputBody ib;
@@ -459,6 +506,7 @@ inline void RunHost(const HostConfig& cfg, std::atomic<bool>& stop, HostStatus& 
                         rd::InputEvent ev;
                         memcpy(&ev, body + sizeof(ib) + i * sizeof(ev), sizeof(ev));
                         if (injectOk) inject.Apply(ev);
+                        else cfg.secure->ForwardInput(0, ev);
                         ++inputNext;
                     }
                     detail::SendAck(sock.s, peer, active, inputNext);
@@ -521,7 +569,15 @@ inline void RunHost(const HostConfig& cfg, std::atomic<bool>& stop, HostStatus& 
         } else {
             tex = cap.Grab(peer.valid ? 4 : 100, lost);
             if (lost) {
-                if (!refresh()) Sleep(300);  // no duplication yet (lock screen, mode change): retry shortly
+                if (!refresh()) {
+                    // Refused for good (two-GPU laptop), not just paused by the lock screen: use GDI from now on.
+                    if (autoMode && cap.DuplicationUnsupported()) {
+                        preferScreenGpu();
+                        switchToGdi("screen duplication refused: the app runs on another GPU than the screen");
+                    } else {
+                        Sleep(300);  // no duplication yet (lock screen, mode change): retry shortly
+                    }
+                }
                 forceKey = true;
                 continue;
             }
