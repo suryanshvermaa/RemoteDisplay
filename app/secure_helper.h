@@ -16,6 +16,8 @@
 
 #include "capture.h"
 #include "common.h"
+#include "inject.h"
+#include "secure.h"
 #include "secure_feed.h"
 
 namespace rdapp {
@@ -68,6 +70,40 @@ inline int RunSecureHelper(bool force) {
     }
     Log(log, "secure-desktop helper started, pid %lu%s", GetCurrentProcessId(), force ? " (forced)" : "");
 
+    // Input for the secure desktop. The ring is writable by SYSTEM and Administrators only.
+    SecureInputReader inputRing;
+    if (!inputRing.Create()) Log(log, "could not create the input queue: the secure screens will be view-only");
+    rdh::InputInjector injector;
+    bool injecting = false, auditedThisEpisode = false;
+    // Applies what the worker queued. Runs on the thread that is attached to the secure desktop, so
+    // SendInput lands there. Input that arrives while the normal desktop is up is thrown away.
+    auto pumpInput = [&](bool secure, const std::wstring& desk) {
+        if (!secure) {
+            inputRing.Clear();
+            if (injecting) {
+                injector.ReleaseAll();
+                injecting = false;
+            }
+            auditedThisEpisode = false;
+            return;
+        }
+        SecureInputEntry e;
+        while (inputRing.Pop(e)) {
+            if (!auditedThisEpisode && e.kind != uint32_t(SecureInputKind::ReleaseAll)) {
+                auditedThisEpisode = true;  // once per UAC prompt / lock screen, not per key
+                std::string deskName;
+                for (wchar_t c : desk) deskName += char(c < 128 ? c : L'?');
+                Audit("secure-desktop-input", "desktop=" + deskName);
+                Log(log, "input is being applied on '%ls'", desk.c_str());
+            }
+            switch (SecureInputKind(e.kind)) {
+                case SecureInputKind::Event: injector.Apply(e.ev); injecting = true; break;
+                case SecureInputKind::Move: injector.Move(e.ev.x, e.ev.y); injecting = true; break;
+                case SecureInputKind::ReleaseAll: injector.ReleaseAll(); injecting = false; break;
+            }
+        }
+    };
+
     HDESK cur = nullptr;      // the desktop this thread is attached to; kept open while it is in use
     std::wstring curName;     // its name
     bool attachNeeded = true; // re-attach even if the name is the same: the desktop object may be new
@@ -112,6 +148,7 @@ inline int RunSecureHelper(bool force) {
 
         const bool secure = !curName.empty() && _wcsicmp(curName.c_str(), L"Default") != 0;
         out.Heartbeat(secure || force);
+        pumpInput(secure || force, curName);
         if (!secure && !force) {
             if (cap) {  // give the GPU back while the normal desktop is up
                 cap.reset();
@@ -131,8 +168,10 @@ inline int RunSecureHelper(bool force) {
                 continue;
             }
         }
+        injector.SetDesktopRect(cap->desktopRect());  // pointer positions map onto this desktop's screens
         bool lost = false;
-        ID3D11Texture2D* tex = cap->Grab(50, lost);  // also paces the loop to the screen's refresh
+        ID3D11Texture2D* tex = cap->Grab(12, lost);  // also paces the loop; short, so typing feels immediate
+        pumpInput(true, curName);
         if (lost) {                                  // desktop switched or locked again: start over
             if (lostCount++ % 50 == 0)
                 Log(log, "duplication lost on '%ls' (%lu times so far)", curName.c_str(), lostCount);

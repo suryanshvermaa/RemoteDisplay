@@ -101,9 +101,10 @@ int main() {
         const std::wstring desk = InputDesktopName();
         wprintf(L"     input desktop: %ls\n", desk.c_str());
         CHECK(!desk.empty(), "the input desktop name can be read");
-        if (!IsElevated() && !SecureDesktopAllowed()) {
-            CHECK(!SetSecureDesktopAllowed(true), "normal rights cannot turn secure-desktop consent on");
-            CHECK(!SecureDesktopAllowed(), "and consent is still off");
+        if (!IsElevated()) {  // the machine-wide switch is administrator-only, whichever way it is set
+            const bool before = SecureDesktopAllowed();
+            CHECK(!SetSecureDesktopAllowed(!before), "normal rights cannot change the secure-desktop switch");
+            CHECK(SecureDesktopAllowed() == before, "and it is left as it was");
         }
         const std::wstring logPath = AuditLogPath();
         DeleteFileW(logPath.c_str());

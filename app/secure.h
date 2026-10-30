@@ -20,19 +20,19 @@ namespace rdapp {
 
 constexpr wchar_t kSecureValue[] = L"AllowSecureDesktop";
 
-// True only if an administrator turned the feature on for this PC.
+// Viewing and controlling the UAC prompt and the sign-in screen is ON by default, like other remote desktop
+// tools. An administrator can turn it off (the switch lives in HKLM, so a connected viewer cannot change it).
+// Every use is written to the audit log either way. Input there needs the host to run as administrator.
 inline bool SecureDesktopAllowed() {
     DWORD v = 0, size = sizeof(v);
-    return RegGetValueW(HKEY_LOCAL_MACHINE, kAdminKey, kSecureValue, RRF_RT_REG_DWORD, nullptr, &v, &size) == ERROR_SUCCESS && v != 0;
+    const LSTATUS r = RegGetValueW(HKEY_LOCAL_MACHINE, kAdminKey, kSecureValue, RRF_RT_REG_DWORD, nullptr, &v, &size);
+    if (r == ERROR_FILE_NOT_FOUND) return true;  // never changed: the default
+    return r == ERROR_SUCCESS && v != 0;
 }
 
-// Needs administrator rights (HKLM). Returns false for normal users.
+// Needs administrator rights (HKLM). Returns false for normal users. "Off" is stored as an explicit 0.
 inline bool SetSecureDesktopAllowed(bool on) {
-    if (!on) {
-        const LSTATUS r = RegDeleteKeyValueW(HKEY_LOCAL_MACHINE, kAdminKey, kSecureValue);
-        return r == ERROR_SUCCESS || r == ERROR_FILE_NOT_FOUND;
-    }
-    const DWORD v = 1;
+    const DWORD v = on ? 1 : 0;
     return RegSetKeyValueW(HKEY_LOCAL_MACHINE, kAdminKey, kSecureValue, REG_DWORD, &v, sizeof(v)) == ERROR_SUCCESS;
 }
 
