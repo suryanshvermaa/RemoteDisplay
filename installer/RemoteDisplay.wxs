@@ -35,7 +35,7 @@
          and remove only it, keeping the app, with
          msiexec /i RemoteDisplaySetup.msi REMOVE=VirtualMonitor -->
     <!-- Only present when the build has the signed driver package (Build-Installer.ps1 passes -dWithDriver=1).
-         Release builds made by CI have no driver, and the MSI then installs the app and service only. -->
+         Without the package the MSI installs the app and service only. -->
     <?ifdef WithDriver?>
     <Feature Id="VirtualMonitor" Title="Virtual monitor driver (optional)"
              Description="Adds the RemoteDisplay virtual monitor, a second screen for sharing." Level="0">

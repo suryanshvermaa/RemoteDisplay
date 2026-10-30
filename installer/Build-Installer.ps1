@@ -3,16 +3,12 @@
 # Needs WiX 3.14 (candle/light). Build the app first:
 #   cmake --build build --config Release --target RemoteDisplay
 # The virtual monitor driver is included when its signed package exists in driver\out\pkg
-# (powershell -File driver\build.ps1 -Package). Without it, the MSI is the app and service only: this is
-# what the CI release build makes, because CI has no WDK and no driver signing certificate.
+# (powershell -File driver\build.ps1 -Package). Without it, the MSI is the app and service only.
 param([string]$Version = "")
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $exe = Join-Path $root "build\Release\RemoteDisplay.exe"
 $pkg = Join-Path $root "driver\out\pkg"
-# A copy of the package is committed in driver\prebuilt, so a CI build (no WDK) can still include it.
-$prebuilt = Join-Path $root "driver\prebuilt"
-if (-not (Test-Path (Join-Path $pkg "RemoteDisplayVirtual.inf")) -and (Test-Path (Join-Path $prebuilt "RemoteDisplayVirtual.inf"))) { $pkg = $prebuilt }
 $stage = Join-Path $PSScriptRoot "stage"
 $out = Join-Path $PSScriptRoot "out"
 
@@ -31,7 +27,7 @@ $candle = Join-Path $wixBin "candle.exe"
 $light = Join-Path $wixBin "light.exe"
 if (-not (Test-Path $candle)) { throw "WiX 3 not found (winget install WiXToolset.WiXToolset --version 3.14.1.8722)" }
 
-# A version given on the command line (the CI passes the release tag) replaces the one in the .wxs.
+# A version given on the command line replaces the one in the .wxs.
 $wxs = Join-Path $PSScriptRoot "RemoteDisplay.wxs"
 if ($Version) {
     $tmp = Join-Path $PSScriptRoot "obj\RemoteDisplay.versioned.wxs"

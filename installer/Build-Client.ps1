@@ -25,7 +25,7 @@ if (-not (Test-Path $candle)) { throw "WiX 3 not found (winget install WiXToolse
 $obj = Join-Path $PSScriptRoot "obj"
 New-Item -ItemType Directory -Force $obj | Out-Null
 $wxs = Join-Path $PSScriptRoot "Client.wxs"
-if ($Version) {  # a version given here (the CI passes the release tag) replaces the one in the .wxs
+if ($Version) {  # a version given here replaces the one in the .wxs
     $tmp = Join-Path $obj "Client.versioned.wxs"
     (Get-Content $wxs -Raw) -replace '(?s)(<Product\b.*?\bVersion=")[0-9.]+(")', "`${1}$Version`$2" | Set-Content $tmp -Encoding UTF8
     $wxs = $tmp
