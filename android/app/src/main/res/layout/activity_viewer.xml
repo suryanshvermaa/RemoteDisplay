@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@android:color/black">
+
+    <!-- The remote screen; resized in code to keep its shape. The touch layer is added above it in code. -->
+    <SurfaceView
+        android:id="@+id/video"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:layout_gravity="center" />
+
+    <TextView
+        android:id="@+id/status"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|center_horizontal"
+        android:layout_marginStart="24dp"
+        android:layout_marginTop="20dp"
+        android:layout_marginEnd="24dp"
+        android:background="@drawable/status_chip"
+        android:gravity="center"
+        android:paddingStart="16dp"
+        android:paddingTop="8dp"
+        android:paddingEnd="16dp"
+        android:paddingBottom="8dp"
+        android:textColor="#FFFFFF"
+        android:textSize="14sp" />
+
+    <!-- Toolbar for keys a touch screen does not have. -->
+    <LinearLayout
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|center_horizontal"
+        android:layout_marginBottom="16dp"
+        android:background="@drawable/toolbar_pill"
+        android:orientation="horizontal"
+        android:padding="6dp">
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btn_keyboard"
+            style="@style/RdToolButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Keyboard" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btn_esc"
+            style="@style/RdToolButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Esc" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btn_tab"
+            style="@style/RdToolButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Tab" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btn_win"
+            style="@style/RdToolButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Win" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btn_close"
+            style="@style/RdToolButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Close" />
+    </LinearLayout>
+</FrameLayout>

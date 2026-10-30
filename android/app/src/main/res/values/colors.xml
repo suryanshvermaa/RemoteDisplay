@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Same palette as the Windows app (app/ui_theme.h): indigo accent, cool grey page, white cards. -->
+<resources>
+    <color name="rd_primary">#4F46E5</color>
+    <color name="rd_on_primary">#FFFFFF</color>
+    <color name="rd_primary_container">#E0E7FF</color>
+    <color name="rd_on_primary_container">#1E1B4B</color>
+    <color name="rd_background">#F6F7FB</color>
+    <color name="rd_surface">#FFFFFF</color>
+    <color name="rd_surface_variant">#F1F3F9</color>
+    <color name="rd_on_surface">#0F172A</color>
+    <color name="rd_on_surface_variant">#64748B</color>
+    <color name="rd_outline">#DDE1EB</color>
+    <color name="rd_error">#DC2626</color>
+    <color name="rd_launcher_bg">#6366F1</color>
+</resources>
