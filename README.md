@@ -1,164 +1,80 @@
-# RemoteDisplay
+# RemoteDisplay 🖥️🔒
 
-Low-latency, end-to-end encrypted remote desktop for Windows, written in C++.
+RemoteDisplay is a low-latency, end-to-end encrypted remote desktop for **Windows to Windows** and **Android to Windows**. Share a Windows screen, approve who can connect, then view or control it from another PC or an Android device.
 
-![Sharing](docs/ui-sharing.png)
+![Current RemoteDisplay desktop app, with addresses and pairing keys hidden](docs/ui-current.png)
 
-## Use it
+## ✨ Features
 
-Build (Visual Studio 2022+ with the C++ desktop workload, CMake 3.20+):
+- 🖥️ Share and control a Windows desktop with mouse, wheel and keyboard.
+- 📱 Connect from the Windows viewer or Android 8.0+ viewer. Discover sharing PCs on the local network and reuse recent connections.
+- 🛡️ Encrypt sessions with AES-128-GCM and an ECDH P-256 key exchange bound to a pairing key.
+- 👤 Approve new viewers on the host, trust a device for future sessions, or allow view-only access by disabling mouse and keyboard control.
+- 🖥️ Duplicate displays or extend to the optional RemoteDisplay virtual monitor.
+- 🌙 Choose light, dark or system-matched theme in the Windows app.
+- 🚀 Run at sign-in from the tray, or install the optional Windows service for background startup.
+- 🔐 With the service installed and administrator consent enabled, view UAC and sign-in/lock screens. They can be controlled when the host runs with administrator rights; otherwise they are view-only.
 
-```
+## 🚀 Quick start
+
+### Download or build
+
+Download installers and viewer builds from [GitHub Releases](https://github.com/suryanshvermaa/RemoteDisplay/releases). The full Windows installer includes the host and viewer. A viewer-only Windows build and an Android APK are also available when published. The optional virtual monitor driver is test-signed and intended for PCs you control; the Android APK is sideloaded rather than distributed through the Play Store.
+
+To build the Windows app, use Windows with Visual Studio 2022 or later and the C++ desktop workload, plus CMake 3.20 or later:
+
+```powershell
 cmake -S . -B build
 cmake --build build --config Release
 ```
 
-Run `build\Release\RemoteDisplay.exe` on both PCs.
+Run `build\Release\RemoteDisplay.exe` on the Windows PC you want to share.
 
-**On the PC you want to view:** click **Start sharing**. Give the other person your address and
-the pairing key shown in the window (Copy buttons are there). The first time, Windows Firewall will
-ask to allow the app on private networks: allow it.
+### Connect
 
-**On the PC you are sitting at:** type the other PC's address and pairing key, click **Connect**. A
-viewer window opens (F11 toggles fullscreen). Recent connections are remembered.
+1. On the PC to be viewed, open RemoteDisplay and click **Start sharing**.
+2. Share the displayed address and pairing key with the viewer. Use the **Copy** buttons to copy them.
+3. On the other Windows PC, enter the address and pairing key and click **Connect**. On Android, choose the PC from **PCs on this network** or enter its address, then enter the key and tap **Connect**.
+4. Approve the new connection on the sharing PC. **Always allow this device** remembers the viewer; **Allow once** grants one-time access; **Deny** rejects it.
 
-**Controlling the remote PC:** click inside the viewer and use your mouse, wheel and keyboard as
-normal. The cursor you see is the remote PC's own cursor shape. The Windows key, Alt+Tab, Alt+Esc
-and Ctrl+Esc go to the remote PC while the viewer is focused. Keys are sent as hardware scancodes,
-so the remote PC's keyboard layout decides the characters. Keys and mouse buttons are released on
-the remote PC if the viewer loses focus, closes or disconnects. Because you can open Windows
-Settings and other apps this way, you can change the remote PC's settings.
+![Windows viewer](docs/ui-viewer.png)
 
-The sharing PC gets an "Allow this device to view and control your PC?" prompt for each new device
-with three choices: **Allow once**, **Always allow this device**, or **Deny** (Deny is the default
-button). It also has a Disconnect button, an **Allow mouse and keyboard control** switch (off = view
-only), and the pairing key can be regenerated at any time. The status line says "viewing" or
-"controlling".
+Click in the Windows viewer to send input. **F11** toggles fullscreen. Windows, Alt+Tab, Alt+Esc and Ctrl+Esc shortcuts go to the remote PC while the viewer is focused. Input is released if the viewer loses focus, closes or disconnects. Keyboard input is sent as hardware scancodes, so the remote PC's keyboard layout determines the resulting characters.
 
-**Trusted devices.** Every viewer has its own permanent device key (stored with Windows DPAPI). If
-you choose *Always allow this device*, that device connects later with no prompt, even after
-restarts, as long as it also has your pairing key. The host remembers only the device's public-key
-fingerprint, and the device proves itself by signing each session, so nothing that was recorded on
-the network can be replayed. *Allow once* and *Deny* remember nothing. Click **Trusted devices...**
-to see and remove them. Generating a new pairing key also locks every device out until it has the
-new key. (Reconnecting from the same IP within 20 seconds of a dropped connection skips the prompt
-too, so a network blip does not nag you.)
+On Android, tap to click, long-press for right click, drag to move or select, and drag with two fingers to scroll. The viewer toolbar provides a keyboard and Esc, Tab and Win keys.
 
-Command-line tools for testing and headless use: `rd-host.exe` and `rd-client.exe`.
+## 🪟 Windows app
 
-## Run it hidden in the background
+The main window has a sharing panel and a connect panel. While sharing, it shows the connection state and offers a disconnect action. The sharing panel includes approval and control settings, display modes, pairing key regeneration and trusted-device management.
 
-There are three ways to run RemoteDisplay on the PC you want to share. Pick one:
+![Connection approval and trusted-device options](docs/ui-approval-trust.png)
 
-| | Window | Admin needed | Starts | Best for |
-|---|---|---|---|---|
-| **Normal app** | yes | no | when you open it | trying it out |
-| **Start with Windows** | hidden; tray icon optional | no | when you sign in | most people, like Parsec/AnyDesk |
-| **Windows service** | none | once, to install | when Windows boots (shares once you are signed in) | always-on PCs |
+The background options include **Start with Windows**, **Show tray icon**, and administrator mode. Closing the window while sharing normally hides it to the tray; the tray menu can reopen the app, start or stop sharing, disconnect a viewer, or exit. You can hide the tray icon too. If approval is disabled, anyone with the pairing key can connect.
 
-**Start with Windows (recommended):** tick **Start with Windows** under *Run in background*. It
-adds a per-user startup entry (`RemoteDisplay.exe --background`), so after you sign in the app starts
-with **no window on screen**, begins sharing, and puts a small icon in the system tray (grey = not
-sharing, green = sharing, amber = someone connecting or connected). Click the icon to open the window,
-right-click for *Start/Stop sharing, Disconnect viewer, Exit*. Closing the window while sharing just
-hides it to the tray. Only one copy runs per user: launching it again brings the running one forward.
-Untick the box (or Settings > Apps > Startup) to undo it.
+The optional Windows service starts with Windows and launches the screen-sharing worker in the signed-in user's session. Install or remove it from **Run in background**; installation requires administrator approval. Sharing starts after a user signs in. The service also runs the helper required for secure-desktop capture.
 
-**Fully invisible (no window, no tray icon):** untick **Show tray icon** (it asks you to confirm).
-RemoteDisplay then runs with nothing at all on screen, like a game-streaming host. To get back in,
-launch RemoteDisplay again from the Start menu or a shortcut: it opens the running instance instead
-of starting a second one. To stop it, open it and click **Stop sharing**, or close its window and
-choose *No: stop sharing and exit*. While the icon is hidden, closing the window while sharing always
-asks first, so it never keeps sharing invisibly by accident. The "Allow this connection?" prompt
-still appears when someone connects (unless you turned it off), so with approval on you are never
-connected to without seeing it. With approval off (unattended access) there is no on-screen sign at
-all, so keep the pairing key private.
+## 🔐 Secure desktop
 
-### Windows service (optional, needs admin)
+Windows normally isolates UAC prompts, sign-in and lock screens on a secure desktop. RemoteDisplay can share these screens when the Windows service is installed and an administrator has enabled **Control UAC and sign-in screens**. The sharing PC must also run with administrator rights to send mouse and keyboard input to them; without that, the screens are view-only. RemoteDisplay cannot interact with Ctrl+Alt+Del. Secure-desktop transitions are recorded in the audit log under `%ProgramData%\RemoteDisplay`.
 
-In the **Run in background** section of the sharing card, click **Install service** (Windows asks
-for administrator approval). That installs `RemoteDisplayHost`, which starts with Windows, adds a
-Windows Firewall rule for UDP 47800 on private/domain networks, and keeps this PC shareable
-without opening the app. **Uninstall service** (greyed out until it is installed; it asks to
-confirm) stops and deletes the service and removes the firewall rule; the app and your settings
-stay. From a command prompt, as administrator: `RemoteDisplay.exe --service-ctl uninstall`.
+## 🔒 Security and network
 
-### Administrator rights (optional)
+- Video and control traffic use authenticated AES-128-GCM encryption. ECDH P-256 key exchange is bound to the pairing key.
+- Each Windows viewer has a persistent device identity protected by Windows DPAPI. A trusted viewer proves its identity on each session; the host stores its public-key fingerprint.
+- Approval is on by default for new devices. Regenerating the pairing key invalidates the old key for every viewer.
+- RemoteDisplay uses UDP port **47800** by default. Devices can connect on the same network or anywhere the host's UDP port is reachable. The installer adds a firewall rule for private and domain networks.
+- There is no relay or automatic NAT traversal. Internet connections may require port forwarding or a VPN such as Tailscale or WireGuard.
 
-Windows refuses mouse and keyboard input from a normal program into an **elevated** window (Task
-Manager run as admin, Registry Editor, installers). To drive those remotely, tick **Run as
-administrator** (one UAC prompt) or click **Restart as admin** to relaunch elevated right now. It
-also applies to the other two ways of running:
+## ⚙️ Requirements and limits
 
-- **Start with Windows** then uses a Scheduled Task with "highest privileges" (created once, no
-  prompt at each sign-in) instead of the normal startup entry, which Windows can never start elevated.
-- **The service** launches its worker with your own account's full-rights token (your account must be
-  an administrator; no password is stored or needed).
+- The sharing host requires 64-bit Windows 10 or 11. Direct3D 11 hardware is recommended; capture and encoding can fall back to software.
+- The Android viewer requires Android 8.0 or later.
+- One viewer can connect at a time. Audio, clipboard sync and file transfer are not supported.
+- IME and dead-key text composition is not forwarded as text because keyboard input is sent as scancodes.
+- Windows may omit content that an app marks as capture-protected.
 
-Untick it to go back; it only changes the start-up entry and the service's worker. Still not
-possible even with admin rights: the **UAC consent screen** and the **lock screen** run on Windows'
-secure desktop, which needs a separate SYSTEM-level component that is not built yet. Running the
-whole app as administrator means a connected viewer can do anything an administrator can do on this
-PC, so only enable it on a PC where you accept that, and keep the pairing key private.
+## 🧰 Developer notes
 
-How it works: screen capture cannot run inside a service (Session 0 has no desktop), so the service
-only supervises. It launches `RemoteDisplay.exe --host-worker` into the signed-in user's session as
-that user, and relaunches it after a crash or when the active user changes. The worker shows the
-"Allow this connection?" prompt on your screen; the app shows its live status and can disconnect it.
-Changing the key or the approval setting restarts the worker automatically.
+The Windows app, host and viewer are written in C++20. The Android viewer is Kotlin and shares the encrypted wire protocol. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the streaming pipeline and [android/README.md](android/README.md) for Android build instructions. The `rd-host.exe` and `rd-client.exe` command-line tools are also available in a CMake build.
 
-Limits: sharing starts once a user is signed in (not at the login screen), a locked screen or UAC
-prompt cannot be viewed yet, and if you move `RemoteDisplay.exe` you must remove and reinstall.
-Logs: `%ProgramData%\RemoteDisplay\service.log` and `%APPDATA%\RemoteDisplay\worker.log`.
-
-### Secure desktop (UAC prompt, sign-in and lock screen): opt-in
-
-Windows draws the UAC prompt, the sign-in screen and the lock screen on a separate "secure desktop"
-that ordinary programs cannot see. RemoteDisplay can show it to a viewer, but only when all of these
-hold:
-
-1. **The Windows service is installed** (Install service). The service runs the helper; without it
-   the secure desktop cannot be seen, and the viewer sees a frozen picture.
-2. **An administrator allowed it**: tick **Allow viewing UAC and sign-in screens (admin)** and accept
-   the UAC prompt. A connected viewer cannot change this. It is stored machine-wide.
-3. **A viewer is connected**, and the desktop is actually the secure one.
-
-What happens then:
-
-- A SYSTEM helper, started on the Winlogon desktop by the service, captures the secure desktop and
-  hands its picture to the worker through shared memory. The viewer sees the UAC prompt or sign-in
-  screen. When the normal desktop returns, the stream switches back automatically.
-- **View only.** Mouse and keyboard input is received and acknowledged, but never sent to the secure
-  desktop. You cannot type a password into a UAC prompt remotely.
-- The pointer is not shown on those screens (the viewer's own pointer is used).
-- Every switch in or out of the secure desktop is written to `%ProgramData%\RemoteDisplayudit.log`
-  with the time, Windows user and process. The helper logs to `secure-helper.log` in the same folder.
-
-Turning consent off stops the helper within a few seconds.
-
-To check it works on your PC, follow [tests/secure_desktop_manual.md](tests/secure_desktop_manual.md).
-
-## Security model
-
-- Every UDP datagram is AES-128-GCM encrypted and authenticated; replays are rejected.
-- Key exchange is ephemeral ECDH P-256, bound to the 128-bit pairing key, so a wrong key never
-  gets a session and a passive eavesdropper learns nothing.
-- Keys are stored with Windows DPAPI (readable only by your Windows user).
-- Approving each new connection on the sharing PC is on by default. For unattended access, untick
-  it; then anyone with your pairing key can view this PC, so keep the key private.
-- The service runs as LocalSystem but only launches the worker as your normal user; it never
-  captures or streams anything itself.
-
-## Current limits
-
-- **UAC prompt and lock screen**: not viewable or controllable (secure desktop), nor Ctrl+Alt+Del;
-  admin windows work once you enable administrator rights (see above).
-- No clipboard or file transfer, no audio; characters typed with an IME or dead keys are not
-  forwarded as text (keys are sent by scancode).
-- **Same network or a reachable address**: no relay or NAT traversal yet, so over the internet you
-  need a port-forward (UDP 47800) or a VPN such as Tailscale/WireGuard.
-- One viewer at a time; primary monitor only; no audio or clipboard.
-- Needs a GPU with a hardware H.264 encoder (NVIDIA, AMD or Intel).
-- Windows may omit windows that apps mark as capture-protected from the shared screen.
-
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the pipeline and roadmap.
+For secure-desktop manual checks, see [tests/secure_desktop_manual.md](tests/secure_desktop_manual.md).
